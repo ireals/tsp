@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TEE Simulator Plus</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <!-- Status Panel -->
+  <section class="status-panel" aria-label="モジュールステータス">
+    <div class="status-row">
+      <div class="status-item">
+        <span class="status-indicator" id="module-status-indicator" aria-label="モジュール状態"></span>
+        <span class="status-label" id="module-status-text">Module Status</span>
+      </div>
+      <div class="status-item">
+        <span class="status-key">Keybox:</span>
+        <span class="status-value" id="active-keybox-name">—</span>
+      </div>
+      <div class="status-item">
+        <span class="status-key">Targets:</span>
+        <span class="status-value" id="target-count">0</span>
+      </div>
+    </div>
+    <p class="status-warning" role="alert">
+      ⚠ 本モジュールはタイミング分析による検知を完全に防ぐことはできません
+    </p>
+  </section>
+
+  <!-- Tab Navigation -->
+  <nav class="tab-bar" role="tablist" aria-label="メインナビゲーション">
+    <button class="tab-item active" role="tab" aria-selected="true" aria-controls="tab-keybox" id="btn-tab-keybox">Keybox</button>
+    <button class="tab-item" role="tab" aria-selected="false" aria-controls="tab-targets" id="btn-tab-targets">Targets</button>
+    <button class="tab-item" role="tab" aria-selected="false" aria-controls="tab-diagnostics" id="btn-tab-diagnostics">Diagnostics</button>
+    <button class="tab-item" role="tab" aria-selected="false" aria-controls="tab-logs" id="btn-tab-logs">Logs</button>
+  </nav>
+
+  <!-- Tab Content -->
+  <main class="tab-content-wrapper">
+    <!-- Keybox Tab -->
+    <div class="tab-content active" id="tab-keybox" role="tabpanel" aria-labelledby="btn-tab-keybox">
+      <div class="card upload-area">
+        <h2 class="card-title">Keybox管理</h2>
+        <button class="btn btn-filled" id="btn-upload-keybox" aria-label="Keyboxファイルをアップロード">
+          <span class="btn-icon">+</span>
+          Keyboxをアップロード
+        </button>
+        <input type="file" id="input-keybox-file" accept=".xml,.json" hidden aria-hidden="true">
+      </div>
+      <div class="card">
+        <h3 class="card-subtitle">登録済みKeybox</h3>
+        <div class="keybox-list" id="keybox-list" aria-label="Keybox一覧">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Targets Tab -->
+    <div class="tab-content" id="tab-targets" role="tabpanel" aria-labelledby="btn-tab-targets" hidden>
+      <div class="card">
+        <div class="search-container">
+          <input type="search" class="input-outlined" id="input-target-search" placeholder="アプリを検索..." aria-label="ターゲットアプリ検索">
+        </div>
+      </div>
+      <div class="card">
+        <div class="targets-actions">
+          <button class="btn btn-outlined" id="btn-import-targets" aria-label="ターゲットリストをインポート">インポート</button>
+          <button class="btn btn-outlined" id="btn-export-targets" aria-label="ターゲットリストをエクスポート">エクスポート</button>
+        </div>
+        <div class="app-list" id="app-list" aria-label="アプリ一覧">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Diagnostics Tab -->
+    <div class="tab-content" id="tab-diagnostics" role="tabpanel" aria-labelledby="btn-tab-diagnostics" hidden>
+      <div class="card">
+        <h2 class="card-title">タイミング診断</h2>
+        <div class="diagnostics-controls">
+          <div class="input-group">
+            <label for="input-sample-count">サンプル数</label>
+            <input type="number" class="input-outlined" id="input-sample-count" value="100" min="10" max="10000" aria-label="サンプル数">
+          </div>
+          <div class="input-group">
+            <label for="input-threshold">閾値 (ms)</label>
+            <input type="number" class="input-outlined" id="input-threshold" value="5" min="1" max="100" step="0.1" aria-label="閾値（ミリ秒）">
+          </div>
+          <div class="diagnostics-buttons">
+            <button class="btn btn-filled" id="btn-run-diagnostics" aria-label="診断を実行">実行</button>
+            <button class="btn btn-outlined" id="btn-calibrate" aria-label="キャリブレーション">キャリブレーション</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card-subtitle">診断結果</h3>
+        <div class="diagnostics-results" id="diagnostics-results" aria-label="診断結果">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Logs Tab -->
+    <div class="tab-content" id="tab-logs" role="tabpanel" aria-labelledby="btn-tab-logs" hidden>
+      <div class="card">
+        <div class="logs-controls">
+          <label for="select-log-level">ログレベル</label>
+          <select class="input-outlined" id="select-log-level" aria-label="ログレベル選択">
+            <option value="verbose">Verbose</option>
+            <option value="debug">Debug</option>
+            <option value="info" selected>Info</option>
+            <option value="warn">Warn</option>
+            <option value="error">Error</option>
+          </select>
+          <span class="refresh-indicator" id="log-refresh-indicator" aria-label="更新中" hidden>⟳</span>
+        </div>
+      </div>
+      <div class="card log-card">
+        <pre class="log-viewer" id="log-viewer" aria-label="ログ表示" role="log"></pre>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

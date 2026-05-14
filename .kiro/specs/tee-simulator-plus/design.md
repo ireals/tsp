@@ -1,0 +1,611 @@
+# Design Document: TEE Simulator Plus
+
+## Overview
+
+TEE Simulator Plus は、TEESimulator の attestation 偽装エンジンを基盤とし、KSU WebUI による GUI 管理、keybox 管理、ターゲットアプリ管理、遅延プロファイラ、遅延補正機構を統合した KernelSU/Magisk モジュールである。
+
+本設計は以下の主要サブシステムで構成される:
+
+1. **Module Installer** — モジュールのインストール・更新・削除
+2. **Keybox Management** — keybox の保管・検証・選択
+3. **Target List Management** — attestation 対象アプリの管理
+4. **WebUI & Shell Bridge** — KSU WebUI による管理画面とバックエンド通信
+5. **Attestation Hook** — keystore2 フックによる attestation 偽装
+6. **Latency Profiler & Equalizer** — 遅延計測と補正
+
+### 設計方針
+
+- **シェルスクリプトバックエンド**: WebUI からの操作は `ksu.exec()` 経由でシェルスクリプトを実行する。複雑なロジックはシェルスクリプトに集約し、WebUI は表示とユーザー操作に専念する。
+- **JSON ベース通信**: Shell Bridge の入出力は全て JSON 形式とし、構造化されたエラーハンドリングを実現する。
+- **ファイルベース永続化**: 設定は `config.json`、keybox は個別 XML ファイルとして保存し、SQLite 等の外部依存を排除する。
+- **TEESimulator 互換**: Attestation Hook は TEESimulator のフックロジックを保持し、上流更新の追従を容易にする。
+
+## Architecture
+
+```mermaid
+graph TB
+    subgraph "KernelSU Manager"
+        WebView[WebView]
+    end
+
+    subgraph "WebUI Layer"
+        HTML[index.html]
+        JS[app.js]
+        CSS[style.css]
+    end
+
+    subgraph "Shell Bridge Layer"
+        KSU_EXEC["ksu.exec() API"]
+        CMD_ROUTER[Command Router]
+    end
+
+    subgraph "Backend Scripts"
+        KBM[keybox_manager.sh]
+        TGM[target_manager.sh]
+        LTP[latency_profiler.sh]
+        CFG[config_manager.sh]
+    end
+
+    subgraph "Data Layer"
+        CONFIG[config/config.json]
+        KEYBOXES[keyboxes/*.xml]
+        LOGS[logs/module.log]
+        TARGET[target.txt]
+    end
+
+    subgraph "Native Layer"
+        HOOK[Attestation Hook<br/>libteesimplus.so]
+        LSPLIT[LSPlt/Zygisk]
+    end
+
+    subgraph "Android System"
+        KEYSTORE2[keystore2 service]
+        ZYGOTE[Zygote]
+    end
+
+    WebView --> HTML
+    HTML --> JS
+    JS --> KSU_EXEC
+    KSU_EXEC --> CMD_ROUTER
+    CMD_ROUTER --> KBM
+    CMD_ROUTER --> TGM
+    CMD_ROUTER --> LTP
+    CMD_ROUTER --> CFG
+    KBM --> CONFIG
+    KBM --> KEYBOXES
+    TGM --> CONFIG
+    TGM --> TARGET
+    LTP --> LOGS
+    CFG --> CONFIG
+    ZYGOTE --> LSPLIT
+    LSPLIT --> HOOK
+    HOOK --> KEYSTORE2
+    HOOK --> KEYBOXES
+    HOOK --> CONFIG
+```
+
+### レイヤー構成
+
+| レイヤー | 責務 | 技術 |
+|---------|------|------|
+| WebUI Layer | ユーザーインターフェース | HTML/JS/CSS (Material Design 3) |
+| Shell Bridge Layer | WebUI ↔ バックエンド通信 | `ksu.exec()` + JSON |
+| Backend Scripts | ビジネスロジック | Bash (POSIX 互換) |
+| Data Layer | 永続化 | JSON ファイル、XML ファイル |
+| Native Layer | Attestation フック | C/C++ (LSPlt/Zygisk) |
+
+## Components and Interfaces
+
+### 1. Module Installer (`customize.sh`)
+
+**責務:** インストール時の環境検証とファイル配置
+
+**インターフェース:**
+```bash
+# 入力: Magisk/KernelSU インストーラ環境変数
+# MODPATH, ARCH, API, IS64BIT
+
+# 処理フロー:
+# 1. 環境検証 (KernelSU/Magisk 検出)
+# 2. API レベル検証 (>= 29)
+# 3. アーキテクチャ検出と適切なライブラリ配置
+# 4. パーミッション設定
+# 5. 既存設定の保持 (アップデート時)
+```
+
+### 2. Keybox Manager (`scripts/keybox_manager.sh`)
+
+**責務:** Keybox の CRUD 操作と選択管理
+
+**コマンドインターフェース:**
+```json
+// 追加
+{"command": "keybox_add", "params": {"path": "/tmp/uploaded.xml", "displayName": "My Keybox"}}
+// 応答: {"status": 0, "data": {"id": "<sha256>", "displayName": "...", "addedAt": 1234567890}}
+
+// 一覧
+{"command": "keybox_list", "params": {}}
+// 応答: {"status": 0, "data": [{"id": "...", "displayName": "...", "addedAt": ..., "certificateSubject": "...", "keyAlgorithm": "...", "isActive": true}]}
+
+// 選択
+{"command": "keybox_select", "params": {"id": "<sha256>"}}
+// 応答: {"status": 0, "data": {"activeKeyboxId": "<sha256>"}}
+
+// 削除
+{"command": "keybox_delete", "params": {"id": "<sha256>"}}
+// 応答: {"status": 0, "data": {"deleted": "<sha256>"}}
+
+// 検証
+{"command": "keybox_validate", "params": {"path": "/tmp/uploaded.xml"}}
+// 応答: {"status": 0, "data": {"valid": true}} or {"status": 1, "message": "INVALID_KEYBOX_SCHEMA: missing PrivateKey"}
+```
+
+**内部処理:**
+- XML パース: `xmlstarlet` または組み込みシェルパーサーで構造検証
+- SHA-256 計算: `sha256sum` コマンド
+- PEM 検証: `openssl` コマンドで Base64 デコード確認
+- ファイル操作: `cp`, `chmod 0600`, `rm`
+
+### 3. Target Manager (`scripts/target_manager.sh`)
+
+**責務:** ターゲットアプリリストの管理
+
+**コマンドインターフェース:**
+```json
+// 一覧 (インストール済みアプリ)
+{"command": "target_list_installed", "params": {}}
+// 応答: {"status": 0, "data": [{"packageName": "com.example.app", "appName": "Example App", "isTarget": true}]}
+
+// ターゲット追加
+{"command": "target_add", "params": {"packageName": "com.example.app"}}
+// 応答: {"status": 0, "data": {"added": "com.example.app", "count": 5}}
+
+// ターゲット削除
+{"command": "target_remove", "params": {"packageName": "com.example.app"}}
+// 応答: {"status": 0, "data": {"removed": "com.example.app", "count": 4}}
+
+// インポート (target.txt 形式)
+{"command": "target_import", "params": {"path": "/tmp/target.txt"}}
+// 応答: {"status": 0, "data": {"imported": 10, "duplicates": 2, "count": 12}}
+
+// エクスポート
+{"command": "target_export", "params": {}}
+// 応答: {"status": 0, "data": {"path": "/data/adb/modules/tee-simulator-plus/config/target.txt", "count": 12}}
+```
+
+**target.txt 形式:**
+```
+# Tricky-Addon compatible target list
+# Generated by TEE Simulator Plus
+com.google.android.gms
+com.android.vending
+```
+
+### 4. Latency Profiler (`scripts/latency_profiler.sh`)
+
+**責務:** 遅延計測と検知判定
+
+**コマンドインターフェース:**
+```json
+// 診断実行
+{"command": "profiler_run", "params": {"sampleCount": 500, "cpuCore": 0}}
+// 応答: {"status": 0, "data": {
+//   "T_a": 0.932,
+//   "T_n": 1.068,
+//   "diff": -0.136,
+//   "ratio": 1.146,
+//   "filteredBadSamples": "20/500",
+//   "threshold": 1.1,
+//   "judgment": "Positive",
+//   "cpuBinding": 0
+// }}
+
+// 参照プロファイル取得
+{"command": "profiler_reference", "params": {}}
+// 応答: {"status": 0, "data": {"mean": 0.85, "stddev": 0.12, "samples": 500}}
+
+// 参照プロファイル計測
+{"command": "profiler_calibrate", "params": {"sampleCount": 500}}
+// 応答: {"status": 0, "data": {"mean": 0.85, "stddev": 0.12, "samples": 500}}
+```
+
+**計測アルゴリズム:**
+1. CPU_Pinning: `taskset` で指定コアに固定
+2. Pre_Warming: 50 回のダミー呼び出し
+3. 計測: `Sample_Count` 回の attested/non-attested 呼び出し
+4. 外れ値除外: 上位/下位 5% を除去
+5. 統計計算: 平均、差分、比率
+6. 判定: ratio vs Detection_Threshold
+
+### 5. Config Manager (`scripts/config_manager.sh`)
+
+**責務:** 設定の読み書きとスキーマ移行
+
+**コマンドインターフェース:**
+```json
+// 設定取得
+{"command": "config_get", "params": {}}
+// 応答: {"status": 0, "data": {"activeKeyboxId": "...", "targetList": [...], "detectionThreshold": 1.1, ...}}
+
+// 設定更新
+{"command": "config_set", "params": {"key": "detectionThreshold", "value": 1.15}}
+// 応答: {"status": 0, "data": {"key": "detectionThreshold", "value": 1.15}}
+
+// ログ取得
+{"command": "log_tail", "params": {"lines": 200}}
+// 応答: {"status": 0, "data": {"lines": ["2024-01-01 12:00:00 [INFO] ...", ...], "total": 1500}}
+
+// ログレベル設定
+{"command": "config_set", "params": {"key": "logLevel", "value": "DEBUG"}}
+```
+
+### 6. Shell Bridge (Command Router)
+
+**責務:** WebUI からのコマンドをバックエンドスクリプトにルーティング
+
+**ホワイトリスト:**
+```
+keybox_add, keybox_list, keybox_select, keybox_delete, keybox_validate
+target_list_installed, target_add, target_remove, target_import, target_export
+profiler_run, profiler_reference, profiler_calibrate
+config_get, config_set, log_tail
+```
+
+**実装 (app.js 内):**
+```javascript
+async function execCommand(command, params = {}) {
+    const WHITELIST = [/* 上記コマンド一覧 */];
+    if (!WHITELIST.includes(command)) {
+        return { status: 400, message: "Unknown command" };
+    }
+    
+    const scriptMap = {
+        'keybox_': 'keybox_manager.sh',
+        'target_': 'target_manager.sh',
+        'profiler_': 'latency_profiler.sh',
+        'config_': 'config_manager.sh',
+        'log_': 'config_manager.sh'
+    };
+    
+    const prefix = Object.keys(scriptMap).find(p => command.startsWith(p));
+    const script = scriptMap[prefix];
+    const input = JSON.stringify({ command, params });
+    
+    try {
+        const result = await ksu.exec(
+            `/data/adb/modules/tee-simulator-plus/scripts/${script}`,
+            input
+        );
+        return JSON.parse(result);
+    } catch (e) {
+        return { status: 500, message: e.message };
+    }
+}
+```
+
+### 7. Attestation Hook (`libs/` — Native C/C++)
+
+**責務:** keystore2 attestation 呼び出しの傍受と偽装応答生成
+
+**アーキテクチャ:**
+- TEESimulator のフックロジックをベースに、設定読み込みと Latency_Equalizer を追加
+- Zygisk モジュールとして `post-fs-data.sh` で登録
+- 対象プロセス fork 時に `shouldHook()` で Target_List を確認
+- フック対象: `IKeystoreService::generateKey`, `IKeystoreService::attestKey`
+
+**Latency_Equalizer 統合:**
+```
+attestKey() 呼び出し
+  → 開始時刻記録
+  → TEESimulator の偽装ロジック実行
+  → 終了時刻記録
+  → elapsed = end - start
+  → IF equalizer_enabled AND reference_profile EXISTS:
+      target_time = T_n / detection_threshold
+      IF elapsed < target_time:
+        wait_time = target_time - elapsed + jitter(stddev)
+        nanosleep(wait_time)
+  → 偽装応答返却
+```
+
+### 8. WebUI Client (`webroot/`)
+
+**責務:** ユーザーインターフェース
+
+**画面構成:**
+```
+┌─────────────────────────────────────┐
+│ TEE Simulator Plus                  │
+├─────────────────────────────────────┤
+│ [Status Panel]                      │
+│  Module: Active | Keybox: MyKB      │
+│  Targets: 5 apps                    │
+│  ⚠ タイミング検知の完全回避は不可能  │
+├─────────────────────────────────────┤
+│ [Tab: Keybox] [Tab: Targets]        │
+│ [Tab: Diagnostics] [Tab: Logs]      │
+├─────────────────────────────────────┤
+│ (Tab Content Area)                  │
+│                                     │
+└─────────────────────────────────────┘
+```
+
+**技術スタック:**
+- Vanilla JavaScript (フレームワーク不使用、軽量化)
+- Material Design 3 CSS (カスタム実装、ダークテーマ既定)
+- Single Page Application (タブ切替)
+
+## Data Models
+
+### config.json スキーマ
+
+```json
+{
+  "schemaVersion": 1,
+  "activeKeyboxId": "a1b2c3d4...",
+  "targetList": [
+    "com.google.android.gms",
+    "com.android.vending"
+  ],
+  "detectionThreshold": 1.1,
+  "sampleCount": 500,
+  "latencyEqualizerEnabled": true,
+  "logLevel": "INFO",
+  "referenceProfile": {
+    "mean": 0.85,
+    "stddev": 0.12,
+    "samples": 500,
+    "measuredAt": 1704067200
+  },
+  "keyboxMetadata": [
+    {
+      "id": "a1b2c3d4e5f6...",
+      "displayName": "Primary Keybox",
+      "addedAt": 1704067200,
+      "certificateSubject": "CN=Android Keystore Key",
+      "keyAlgorithm": "EC"
+    }
+  ]
+}
+```
+
+### Keybox XML 内部表現
+
+```
+KeyboxData {
+  keyAlgorithm: string        // "EC" | "RSA"
+  privateKey: bytes           // DER エンコード秘密鍵
+  certificateChain: [bytes]   // DER エンコード証明書リスト (リーフ → ルート順)
+  deviceId: string            // (オプション) デバイス ID
+}
+```
+
+### Keybox XML スキーマ (入力形式)
+
+```xml
+<?xml version="1.0"?>
+<AndroidAttestation>
+  <NumberOfKeyboxes>1</NumberOfKeyboxes>
+  <Keybox DeviceID="...">
+    <Key algorithm="ecdsa|rsa">
+      <PrivateKey format="pem">
+-----BEGIN EC PRIVATE KEY-----
+...
+-----END EC PRIVATE KEY-----
+      </PrivateKey>
+      <CertificateChain>
+        <NumberOfCertificates>N</NumberOfCertificates>
+        <Certificate format="pem">
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+        </Certificate>
+        <!-- ... additional certificates ... -->
+      </CertificateChain>
+    </Key>
+  </Keybox>
+</AndroidAttestation>
+```
+
+### Profiler 結果データ
+
+```json
+{
+  "timestamp": 1704067200,
+  "cpuBinding": 0,
+  "sampleCount": 500,
+  "preWarmCount": 50,
+  "attestedSamples": [0.91, 0.93, ...],
+  "nonAttestedSamples": [1.05, 1.07, ...],
+  "filteredAttestedSamples": [0.92, 0.93, ...],
+  "filteredNonAttestedSamples": [1.06, 1.07, ...],
+  "T_a": 0.932,
+  "T_n": 1.068,
+  "diff": -0.136,
+  "ratio": 1.146,
+  "filteredBadSamples": "20/500",
+  "threshold": 1.1,
+  "judgment": "Positive"
+}
+```
+
+### Module Log 形式
+
+```
+YYYY-MM-DD HH:MM:SS [LEVEL] component: message
+```
+
+例:
+```
+2024-01-01 12:00:00 [INFO] keybox_manager: Keybox added id=a1b2c3d4 name="Primary"
+2024-01-01 12:00:01 [INFO] profiler: Register timer cpu0 attested 0.932ms non-attested 1.068ms diff -0.136ms ratio 1.146x filteredBadSamples=20/500 threshold > 1.1x Positive
+2024-01-01 12:00:02 [WARN] equalizer: Reference profile not found, skipping delay injection
+```
+
+## Correctness Properties
+
+*A property is a characteristic or behavior that should hold true across all valid executions of a system—essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+
+### Property 1: Keybox Parser Round-Trip
+
+*For any* structurally valid keybox XML, parsing it to internal representation, printing back to XML, and parsing again SHALL produce an internal representation equivalent to the first parse result.
+
+**Validates: Requirements 3.6**
+
+### Property 2: Target_List Set Invariant
+
+*For any* Target_List and any package name, adding the package name SHALL result in a list whose size is either unchanged (if the package was already present) or increased by exactly 1 (if the package was new), and the package SHALL be a member of the resulting list.
+
+**Validates: Requirements 4.3, 4.6**
+
+### Property 3: Latency_Equalizer Ratio Guarantee
+
+*For any* positive values of T_n and Detection_Threshold (where Detection_Threshold >= 1.01), when Latency_Equalizer is enabled and a reference profile exists, the adjusted T_a_simulated SHALL satisfy `T_n / T_a_simulated <= Detection_Threshold`.
+
+**Validates: Requirements 9.2**
+
+### Property 4: Configuration_Store Idempotence
+
+*For any* valid configuration object, writing it to Configuration_Store twice SHALL produce a `config.json` byte-identical to writing it once.
+
+**Validates: Requirements 11**
+
+### Property 5: Shell_Bridge Response Structure
+
+*For any* command string (whether in the whitelist or not), Shell_Bridge SHALL return a JSON object containing a numeric `status` field, where `status == 0` implies a `data` field exists, and `status != 0` implies a `message` field (string) exists.
+
+**Validates: Requirements 6.3, 6.4**
+
+### Property 6: Keybox_Store Filename Consistency
+
+*For any* keybox file stored in Keybox_Store, the filename (excluding `.xml` extension) SHALL equal the SHA-256 hex digest of the file's content.
+
+**Validates: Requirements 2.1**
+
+### Property 7: Target_List Import/Export Round-Trip
+
+*For any* Target_List, exporting to `target.txt` format and importing the result into an empty Target_List SHALL produce a list equivalent to the original (same set of package names).
+
+**Validates: Requirements 4.5**
+
+### Property 8: Profiler Judgment Correctness
+
+*For any* ratio value and Detection_Threshold, the judgment SHALL be `Positive` if and only if `ratio > Detection_Threshold`, and `Negative` otherwise.
+
+**Validates: Requirements 8.5, 8.6**
+
+### Property 9: Outlier Removal Correctness
+
+*For any* array of N measurements (N >= 20), removing the top 5% and bottom 5% SHALL result in an array of size `N - 2 * floor(N * 0.05)` containing only values from the original array that are between the 5th and 95th percentiles.
+
+**Validates: Requirements 8.3**
+
+### Property 10: Jitter Injection Bounds
+
+*For any* reference profile with standard deviation σ, the jitter value added by Latency_Equalizer SHALL have absolute value less than or equal to σ.
+
+**Validates: Requirements 9.6**
+
+### Property 11: Keybox Parser Error Classification
+
+*For any* XML input that is missing a required element (`AndroidAttestation`, `Keybox`, `Key`, `PrivateKey`, or `CertificateChain`), Keybox_Parser SHALL return error code `INVALID_KEYBOX_SCHEMA`. *For any* XML input with structurally correct elements but invalid PEM encoding, Keybox_Parser SHALL return error code `INVALID_PEM_ENCODING`.
+
+**Validates: Requirements 3.3, 3.4**
+
+## Error Handling
+
+### エラー分類
+
+| カテゴリ | エラーコード | 対応 |
+|---------|------------|------|
+| Keybox 検証 | `INVALID_KEYBOX_SCHEMA` | WebUI にエラー表示、追加拒否 |
+| Keybox 検証 | `INVALID_PEM_ENCODING` | WebUI にエラー表示、追加拒否 |
+| Shell Bridge | `400` (Unknown command) | WebUI にエラー表示 |
+| Shell Bridge | `408` (Timeout) | WebUI にタイムアウト表示 |
+| Shell Bridge | `500` (Internal error) | WebUI にエラー表示、ログ記録 |
+| Config | パース失敗 | 既定値で起動、ログ記録 |
+| Config | 書き込み失敗 | WebUI にエラー表示、ログ記録 |
+| Profiler | CPU_Pinning 失敗 | 警告ログ、ピニングなしで続行 |
+| Equalizer | 参照プロファイル未取得 | 待機挿入スキップ、警告ログ |
+| Log | 書き込み失敗 | logcat フォールバック |
+| Install | 非対応環境 | `abort` メッセージ出力 |
+
+### エラー伝播フロー
+
+```mermaid
+graph LR
+    A[Backend Script Error] --> B{ログ記録}
+    B --> C[JSON エラー応答生成]
+    C --> D[Shell Bridge 返却]
+    D --> E[WebUI エラー表示]
+    
+    F[ログ書き込み失敗] --> G[logcat フォールバック]
+    H[Config パース失敗] --> I[既定値使用 + ログ]
+```
+
+### リカバリ戦略
+
+1. **Config 破損**: `config.json.bak` から復元を試行、失敗時は既定値
+2. **Active Keybox 消失**: `activeKeyboxId` をクリア、WebUI に通知
+3. **スクリプトタイムアウト**: プロセス kill、408 応答
+4. **ディスク容量不足**: ログローテーション強制実行
+
+## Testing Strategy
+
+### テストアプローチ
+
+本モジュールはシェルスクリプトバックエンドと JavaScript フロントエンドで構成されるため、以下のテスト戦略を採用する。
+
+#### Property-Based Testing (PBT)
+
+**ライブラリ:** [fast-check](https://github.com/dubzzz/fast-check) (JavaScript/TypeScript)
+
+シェルスクリプトのロジックを JavaScript でモデル化し、property-based testing を実施する。これにより:
+- Keybox パーサーの round-trip 検証
+- Target_List の集合演算検証
+- Shell Bridge の応答構造検証
+- Profiler の計算ロジック検証
+- Equalizer の境界条件検証
+
+が可能となる。
+
+**設定:**
+- 各プロパティテスト: 最低 100 イテレーション
+- タグ形式: `Feature: tee-simulator-plus, Property {N}: {property_text}`
+
+#### Unit Tests (Example-Based)
+
+**ライブラリ:** [Vitest](https://vitest.dev/) (JavaScript/TypeScript)
+
+- Keybox XML パースの具体例テスト
+- Config スキーマ移行テスト
+- コマンドルーティングテスト
+- ログフォーマットテスト
+
+#### Integration Tests
+
+- Shell Bridge → バックエンドスクリプト実行テスト (モック環境)
+- WebUI → Shell Bridge 通信テスト
+- Module インストールフローテスト
+
+#### テストファイル構成
+
+```
+tests/
+├── properties/
+│   ├── keybox-parser.property.test.ts    # CP-1, CP-11
+│   ├── target-list.property.test.ts      # CP-2, CP-7
+│   ├── shell-bridge.property.test.ts     # CP-5
+│   ├── config-store.property.test.ts     # CP-4, CP-6
+│   ├── profiler.property.test.ts         # CP-8, CP-9
+│   └── equalizer.property.test.ts        # CP-3, CP-10
+├── unit/
+│   ├── keybox-parser.test.ts
+│   ├── target-manager.test.ts
+│   ├── config-manager.test.ts
+│   ├── profiler-calc.test.ts
+│   └── command-router.test.ts
+└── integration/
+    ├── shell-bridge.test.ts
+    └── webui-flow.test.ts
+```

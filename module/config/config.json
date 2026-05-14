@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "activeKeyboxId": "",
+  "targetList": [],
+  "detectionThreshold": 1.1,
+  "sampleCount": 500,
+  "latencyEqualizerEnabled": true,
+  "logLevel": "INFO",
+  "referenceProfile": null,
+  "keyboxMetadata": []
+}

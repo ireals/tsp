@@ -1,0 +1,22 @@
+# TEE Simulator Plus - SELinux Policy Rules
+
+# Allow module to read/write its own data directory
+allow system_app tee_simulator_data_file dir { create read write open getattr search add_name remove_name };
+allow system_app tee_simulator_data_file file { create read write open getattr setattr unlink rename };
+
+# Allow execution of module scripts
+allow zygote tee_simulator_exec exec_type { execute execute_no_trans };
+allow untrusted_app tee_simulator_exec file { read open execute getattr };
+
+# Allow access to keystore2 service
+allow system_server keystore keystore2_key_service { use };
+allow platform_app keystore_service service_manager { find };
+
+# Allow Zygisk/injection context
+allow zygote zygote_exec file { execute read open getattr };
+allow zygote app_data_file dir { search read open getattr };
+allow zygote app_data_file file { read open getattr };
+
+# Allow network access for WebUI (KSU WebUI uses localhost)
+allow platform_app node tcp_socket { name_connect };
+allow system_app self tcp_socket { create connect write read };

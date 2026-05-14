@@ -1,0 +1,7 @@
+id=tee-simulator-plus
+name=TEE Simulator Plus
+version=v1.0.0
+versionCode=1
+author=TEE Simulator Plus Team
+description=TEE attestation simulator with KSU WebUI management, custom keybox selection, target app list, and latency profiler/equalizer. Based on TEESimulator with Tricky-Addon features.
+updateJson=https://raw.githubusercontent.com/user/tee-simulator-plus/main/update.json

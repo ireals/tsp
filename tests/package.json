@@ -1,0 +1,16 @@
+{
+  "name": "tee-simulator-plus-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.0",
+    "fast-check": "^3.19.0",
+    "@vitest/coverage-v8": "^2.0.0"
+  }
+}
