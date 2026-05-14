@@ -101,40 +101,63 @@ jobs:
           echo "=== gradle.properties (final) ==="
           cat gradle.properties
 
-          # TEESimulator's gradle layout: app + stub. The module zip is built via a Gradle task.
-          ./gradlew assembleRelease --stacktrace --no-daemon || \
-            ./gradlew :app:assembleRelease --stacktrace --no-daemon
+          # TEESimulator's build script defines a `zipRelease` task that produces
+          # the flashable Magisk/KSU module zip in ./out/. Use it directly.
+          echo "=== Available Gradle tasks (filtered) ==="
+          ./gradlew tasks --all --no-daemon 2>&1 | grep -iE 'zip|module|assemble' | head -20 || true
 
+          ./gradlew :app:zipRelease --stacktrace --no-daemon
+
+          echo ""
           echo "=== Build outputs ==="
-          find . -name "*.zip" -path "*/outputs/*" 2>/dev/null
+          ls -la out/ 2>/dev/null || echo "no out/ dir"
+          find . -name "TEESimulator*.zip" 2>/dev/null
           find . -name "*.apk" -path "*/outputs/*" 2>/dev/null
-          find module -type f 2>/dev/null | head -20 || true
 
       - name: Locate built artifacts
         id: locate
         run: |
-          # Find the produced module zip — TEESimulator typically packages a magisk/ksu zip
-          MODULE_ZIP=$(find teesimulator -name "TEESimulator*.zip" 2>/dev/null | head -1)
+          echo "=== Looking in teesimulator/out/ (zipRelease output) ==="
+          ls -la teesimulator/out/ 2>/dev/null || echo "no out/ dir"
+
+          # Primary: the zipRelease task outputs to out/TEESimulator-*-Release.zip
+          MODULE_ZIP=$(find teesimulator/out -name "TEESimulator-*Release.zip" 2>/dev/null | head -1)
+
           if [ -z "$MODULE_ZIP" ]; then
-            MODULE_ZIP=$(find teesimulator -name "*.zip" -path "*/outputs/*" 2>/dev/null | head -1)
+            echo "Primary location empty, scanning entire repo..."
+            # Fallback: search anywhere, but exclude debug-symbols/intermediates/mapping
+            for candidate in $(find teesimulator -name "TEESimulator*.zip" 2>/dev/null); do
+              case "$candidate" in
+                *native-debug-symbols*|*intermediates*|*mapping*|*sources*|*Debug*) continue ;;
+              esac
+              MODULE_ZIP="$candidate"
+              break
+            done
           fi
+
           if [ -z "$MODULE_ZIP" ]; then
-            # Fallback: build module zip manually from app/build/outputs and module/ template
-            echo "No prebuilt zip — assembling manually"
-            mkdir -p _manual_module
-            cp -r teesimulator/module/* _manual_module/ 2>/dev/null || true
-            APK=$(find teesimulator/app/build/outputs/apk/release -name "*.apk" 2>/dev/null | head -1)
-            if [ -n "$APK" ]; then
-              cp "$APK" _manual_module/teesimulator.apk
-            fi
-            cd _manual_module
-            zip -r9 ../_manual_teesimulator.zip . >/dev/null
-            cd ..
-            MODULE_ZIP="$PWD/_manual_teesimulator.zip"
+            echo "ERROR: No module zip produced by zipRelease task"
+            echo "=== All zip files ==="
+            find teesimulator -name "*.zip" 2>/dev/null | head -30
+            exit 1
           fi
-          echo "Module zip: $MODULE_ZIP"
-          echo "module_zip=$MODULE_ZIP" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "=== Selected module zip: $MODULE_ZIP ==="
           ls -la "$MODULE_ZIP"
+          echo ""
+          echo "=== Module zip contents ==="
+          unzip -l "$MODULE_ZIP"
+
+          # Verify it has Magisk module structure
+          if ! unzip -l "$MODULE_ZIP" | grep -q "module.prop"; then
+            echo "ERROR: Selected zip doesn't contain module.prop"
+            exit 1
+          fi
+
+          # Convert to absolute path for next step
+          ABS_PATH=$(realpath "$MODULE_ZIP")
+          echo "module_zip=$ABS_PATH" >> $GITHUB_OUTPUT
 
       - name: Merge with WebUI overlay
         run: |
