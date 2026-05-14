@@ -8,6 +8,7 @@ add_library(teesimplus SHARED
     main.cpp
     hook.cpp
     equalizer.cpp
+    zygisk_stubs.cpp
 )
 
 target_include_directories(teesimplus PRIVATE
@@ -20,5 +21,5 @@ target_link_libraries(teesimplus
 )
 
 target_compile_options(teesimplus PRIVATE
-    -Wall -Wextra -O2 -fvisibility=hidden
+    -Wall -Wextra -O2 -fvisibility=hidden -Wno-unused-parameter
 )

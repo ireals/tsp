@@ -1,6 +1,8 @@
 // Zygisk API header — Minimal subset for TEE Simulator Plus
 // Based on https://github.com/topjohnwu/zygisk-module-sample
-// Full header: https://github.com/topjohnwu/Magisk/blob/master/native/src/external/include/zygisk/api.hpp
+//
+// The Zygisk framework dynamically resolves these symbols at runtime.
+// We provide weak stub implementations so the module links without errors.
 
 #pragma once
 
@@ -10,18 +12,23 @@
 
 namespace zygisk {
 
-struct Api;
 struct AppSpecializeArgs;
 struct ServerSpecializeArgs;
 
-class ModuleBase {
-public:
-    virtual void onLoad([[maybe_unused]] Api *api, [[maybe_unused]] JNIEnv *env) {}
-    virtual void preAppSpecialize([[maybe_unused]] AppSpecializeArgs *args) {}
-    virtual void postAppSpecialize([[maybe_unused]] const AppSpecializeArgs *args) {}
-    virtual void preServerSpecialize([[maybe_unused]] ServerSpecializeArgs *args) {}
-    virtual void postServerSpecialize([[maybe_unused]] const ServerSpecializeArgs *args) {}
-    virtual ~ModuleBase() = default;
+enum Option : int {
+    FORCE_DENYLIST_UNMOUNT = 0,
+    DLCLOSE_MODULE_LIBRARY = 1,
+};
+
+struct Api {
+    // These are implemented as weak symbols — the Zygisk framework
+    // overrides them at runtime when loading the module.
+    void setOption(Option opt);
+    int getFlags();
+    int connectCompanion();
+    void pltHookRegister(const char *regex, const char *symbol, void *newFunc, void **oldFunc);
+    void pltHookExclude(const char *regex, const char *symbol);
+    bool pltHookCommit();
 };
 
 struct AppSpecializeArgs {
@@ -53,30 +60,27 @@ struct ServerSpecializeArgs {
     jlong &effective_capabilities;
 };
 
-enum Option : int {
-    FORCE_DENYLIST_UNMOUNT = 0,
-    DLCLOSE_MODULE_LIBRARY = 1,
-};
-
-struct Api {
-    void setOption(Option opt);
-    int getFlags();
-    int connectCompanion();
-    void pltHookRegister(const char *regex, const char *symbol, void *newFunc, void **oldFunc);
-    void pltHookExclude(const char *regex, const char *symbol);
-    bool pltHookCommit();
+class ModuleBase {
+public:
+    virtual void onLoad([[maybe_unused]] Api *api, [[maybe_unused]] JNIEnv *env) {}
+    virtual void preAppSpecialize([[maybe_unused]] AppSpecializeArgs *args) {}
+    virtual void postAppSpecialize([[maybe_unused]] const AppSpecializeArgs *args) {}
+    virtual void preServerSpecialize([[maybe_unused]] ServerSpecializeArgs *args) {}
+    virtual void postServerSpecialize([[maybe_unused]] const ServerSpecializeArgs *args) {}
+    virtual ~ModuleBase() = default;
 };
 
 } // namespace zygisk
 
+// Macro to register a Zygisk module class.
+// The Zygisk framework looks for these exported symbols when loading the .so.
 #define REGISTER_ZYGISK_MODULE(clazz) \
-void *_zygisk_module_entry = nullptr; \
 extern "C" [[gnu::visibility("default")]] void zygisk_module_entry( \
     zygisk::Api *api, JNIEnv *env) { \
     static clazz module; \
     module.onLoad(api, env); \
-    _zygisk_module_entry = &module; \
 } \
-extern "C" [[gnu::visibility("default")]] int zygisk_companion_entry(int fd) { \
-    (void)fd; return 0; \
+extern "C" [[gnu::visibility("default")]] int zygisk_companion_entry( \
+    [[maybe_unused]] int fd) { \
+    return 0; \
 }

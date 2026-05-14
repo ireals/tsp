@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include "include/teesimplus.h"
 #include <time.h>
 #include <stdlib.h>
