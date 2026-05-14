@@ -603,3 +603,57 @@ select.input-outlined {
   color: var(--md-sys-color-outline);
   font-size: 14px;
 }
+/* Toggle row for equalizer settings */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  cursor: pointer;
+  user-select: none;
+}
+.toggle-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--md-sys-color-primary);
+}
+
+/* Advisory message in diagnostics */
+.advisory {
+  margin-top: 12px;
+  padding: 12px;
+  background: rgba(245, 200, 66, 0.12);
+  border-left: 3px solid var(--md-sys-color-warning);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--md-sys-color-warning);
+  grid-column: 1 / -1;
+}
+
+/* Toast styles */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translate(-50%, 60px);
+  padding: 12px 20px;
+  border-radius: 8px;
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  font-size: 14px;
+  max-width: 80%;
+  opacity: 0;
+  transition: transform 0.3s ease, opacity 0.3s ease;
+  z-index: 1000;
+}
+.toast-visible {
+  transform: translate(-50%, 0);
+  opacity: 1;
+}
+.toast-error {
+  border-left: 3px solid var(--md-sys-color-error);
+}
+.toast-success {
+  border-left: 3px solid var(--md-sys-color-positive);
+}

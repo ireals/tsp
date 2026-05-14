@@ -8,121 +8,156 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      tricky_store_version:
-        description: 'Tricky-Store release tag (default: 1.2.1)'
+      tricky_store_repo:
+        description: 'TrickyStore source repo'
         required: false
-        default: '1.2.1'
+        default: 'qwq233/TrickyStore'
+      tricky_store_ref:
+        description: 'Branch/tag/commit'
+        required: false
+        default: 'master'
 
 env:
-  TRICKY_STORE_VERSION: ${{ github.event.inputs.tricky_store_version || '1.2.1' }}
-  TRICKY_STORE_REPO: '5ec1cff/TrickyStore'
+  TRICKY_STORE_REPO: ${{ github.event.inputs.tricky_store_repo || 'qwq233/TrickyStore' }}
+  TRICKY_STORE_REF: ${{ github.event.inputs.tricky_store_ref || 'master' }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout WebUI
+      - name: Checkout WebUI overlay
         uses: actions/checkout@v4
+        with:
+          path: overlay
 
-      - name: Download Tricky-Store release
-        run: |
-          mkdir -p _tricky_store
-          cd _tricky_store
-          # Try downloading the release zip from upstream
-          TS_URL="https://github.com/${{ env.TRICKY_STORE_REPO }}/releases/download/${{ env.TRICKY_STORE_VERSION }}/Tricky-Store-${{ env.TRICKY_STORE_VERSION }}-release.zip"
-          echo "Downloading: $TS_URL"
-          # Try multiple naming patterns
-          curl -sL -f -o tricky_store.zip "$TS_URL" || \
-            curl -sL -f -o tricky_store.zip "https://github.com/${{ env.TRICKY_STORE_REPO }}/releases/download/${{ env.TRICKY_STORE_VERSION }}/Tricky-Store-${{ env.TRICKY_STORE_VERSION }}.zip" || \
-            { echo "Failed to download Tricky-Store zip; listing release assets:"; \
-              curl -sL "https://api.github.com/repos/${{ env.TRICKY_STORE_REPO }}/releases/tags/${{ env.TRICKY_STORE_VERSION }}" | grep '"browser_download_url"' || true; \
-              exit 1; }
-          echo "Downloaded:"
-          ls -la tricky_store.zip
-          unzip -l tricky_store.zip | head -50
+      - name: Checkout TrickyStore source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TRICKY_STORE_REPO }}
+          ref: ${{ env.TRICKY_STORE_REF }}
+          path: trickystore
+          submodules: recursive
 
-      - name: Extract Tricky-Store contents
+      - name: Apply latency equalizer patch
         run: |
-          mkdir -p _tricky_store/extracted
-          cd _tricky_store
-          unzip -o tricky_store.zip -d extracted
-          echo "=== Tricky-Store structure ==="
-          find extracted -maxdepth 4 -type f | head -50
+          cd trickystore
+          
+          # Locate KeystoreInterceptor.kt
+          INTERCEPTOR=$(find . -name "KeystoreInterceptor.kt" | head -1)
+          if [ -z "$INTERCEPTOR" ]; then
+            echo "ERROR: KeystoreInterceptor.kt not found"
+            exit 1
+          fi
+          echo "Patching: $INTERCEPTOR"
+          
+          # Apply our latency equalizer patch
+          python3 ../overlay/patches/apply_latency_patch.py "$INTERCEPTOR"
+          
+          echo "=== Modified KeystoreInterceptor.kt (head) ==="
+          head -80 "$INTERCEPTOR"
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('trickystore/**/*.gradle*', 'trickystore/**/gradle-wrapper.properties') }}
+
+      - name: Build TrickyStore module
+        working-directory: trickystore
+        run: |
+          chmod +x gradlew
+          ./gradlew :module:assembleRelease --stacktrace || \
+            ./gradlew assembleRelease --stacktrace
+          
+          echo "=== Build outputs ==="
+          find . -name "*.zip" -path "*/outputs/*" 2>/dev/null
+          find module -name "*.so" 2>/dev/null | head -10
+
+      - name: Locate built module zip
+        id: locate
+        run: |
+          # Tricky-Store builds produce a zip via the magisk module gradle task
+          MODULE_ZIP=$(find trickystore -name "*.zip" -path "*/outputs/*" | head -1)
+          if [ -z "$MODULE_ZIP" ]; then
+            # Fallback: look for module/build/outputs/
+            MODULE_ZIP=$(find trickystore/module/build -name "*.zip" 2>/dev/null | head -1)
+          fi
+          if [ -z "$MODULE_ZIP" ]; then
+            echo "ERROR: No module zip found"
+            find trickystore -name "*.zip" 2>/dev/null
+            find trickystore/module -type d 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "Found: $MODULE_ZIP"
+          echo "module_zip=$MODULE_ZIP" >> $GITHUB_OUTPUT
 
       - name: Merge with WebUI overlay
         run: |
-          # Start with Tricky-Store as base
-          rm -rf module_final
-          cp -r _tricky_store/extracted module_final
+          mkdir -p _staging
+          cd _staging
           
-          echo "=== Base Tricky-Store files ==="
-          ls -la module_final/
+          # Extract built TrickyStore zip
+          unzip -o "../${{ steps.locate.outputs.module_zip }}" >/dev/null
+          echo "=== TrickyStore module structure ==="
+          find . -maxdepth 3 -type f | sort
           
-          # Overlay our WebUI and additional scripts
-          # Important: Do NOT overwrite Tricky-Store's core scripts (post-fs-data.sh, service.sh, customize.sh)
-          # We only add WebUI components
+          # Add WebUI overlay
+          cp -r ../overlay/module/webroot ./
+          mkdir -p scripts
+          cp ../overlay/module/scripts/bridge.sh scripts/
+          cp ../overlay/module/scripts/keybox_manager.sh scripts/
+          cp ../overlay/module/scripts/target_manager.sh scripts/
+          cp ../overlay/module/scripts/config_manager.sh scripts/
+          cp ../overlay/module/scripts/latency_profiler.sh scripts/
+          chmod +x scripts/*.sh
           
-          # Add webroot for KSU WebUI
-          cp -r module/webroot module_final/
-          echo "  + webroot/ added"
+          mkdir -p docs config logs
+          cp -r ../overlay/module/docs/* docs/ 2>/dev/null || true
+          cp ../overlay/module/config/config.json config/ 2>/dev/null || true
           
-          # Add scripts directory but rename to avoid conflicts with Tricky-Store
-          mkdir -p module_final/scripts
-          cp module/scripts/bridge.sh module_final/scripts/
-          cp module/scripts/keybox_manager.sh module_final/scripts/
-          cp module/scripts/target_manager.sh module_final/scripts/
-          cp module/scripts/config_manager.sh module_final/scripts/
-          cp module/scripts/latency_profiler.sh module_final/scripts/
-          chmod +x module_final/scripts/*.sh
-          echo "  + scripts/ added"
-          
-          # Add docs
-          mkdir -p module_final/docs
-          cp -r module/docs/* module_final/docs/ 2>/dev/null || true
-          
-          # Add config directory
-          mkdir -p module_final/config module_final/logs
-          cp module/config/config.json module_final/config/ 2>/dev/null || true
-          
-          # Update module.prop to reflect this is a combined package
-          if [ -f module_final/module.prop ]; then
-            echo "=== Original Tricky-Store module.prop ==="
-            cat module_final/module.prop
-            
-            # Modify id and name to indicate combined package
-            sed -i 's/^id=.*/id=tee-simulator-plus/' module_final/module.prop
-            sed -i 's/^name=.*/name=TEE Simulator Plus (Tricky-Store + WebUI)/' module_final/module.prop
-            sed -i 's/^description=.*/description=Tricky-Store with KSU WebUI for keybox and target management. Includes upstream Tricky-Store core (5ec1cff)./' module_final/module.prop
-            
-            echo "=== Modified module.prop ==="
-            cat module_final/module.prop
+          # Update module.prop to combine identity
+          if [ -f module.prop ]; then
+            sed -i 's/^id=.*/id=tee-simulator-plus/' module.prop
+            sed -i 's/^name=.*/name=TEE Simulator Plus (TrickyStore + WebUI + Latency Equalizer)/' module.prop
           fi
           
-          # Append WebUI initialization to existing post-fs-data.sh (if any)
-          if [ -f module_final/post-fs-data.sh ]; then
-            echo "" >> module_final/post-fs-data.sh
-            echo "# === TEE Simulator Plus WebUI initialization ===" >> module_final/post-fs-data.sh
-            echo "MODDIR=\${0%/*}" >> module_final/post-fs-data.sh
-            echo "[ -d /data/adb/tricky_store ] || mkdir -p /data/adb/tricky_store" >> module_final/post-fs-data.sh
-            echo "[ -f /data/adb/tricky_store/target.txt ] || { echo '# Tricky-Store target list' > /data/adb/tricky_store/target.txt; chmod 644 /data/adb/tricky_store/target.txt; }" >> module_final/post-fs-data.sh
+          # Append WebUI bootstrap to post-fs-data.sh
+          if [ -f post-fs-data.sh ]; then
+            echo "" >> post-fs-data.sh
+            echo "# === TEE Simulator Plus initialization ===" >> post-fs-data.sh
+            echo "[ -d /data/adb/tricky_store ] || mkdir -p /data/adb/tricky_store" >> post-fs-data.sh
+            echo "[ -f /data/adb/tricky_store/target.txt ] || { echo '# Tricky-Store target list' > /data/adb/tricky_store/target.txt; chmod 644 /data/adb/tricky_store/target.txt; }" >> post-fs-data.sh
           fi
           
-          echo "=== Final module structure ==="
-          find module_final -maxdepth 3 -type f | sort
+          echo "=== Final structure ==="
+          find . -maxdepth 3 -type f | sort
 
-      - name: Package combined zip
+      - name: Package final zip
         run: |
-          cd module_final
+          cd _staging
           zip -r9 ../tee-simulator-plus-v1.0.0.zip . -x "*.gitkeep"
           cd ..
-          echo "=== Final zip ==="
           ls -la tee-simulator-plus-v1.0.0.zip
-          echo ""
-          echo "=== Contents ==="
           unzip -l tee-simulator-plus-v1.0.0.zip
-          echo ""
-          echo "=== Integrity check ==="
           unzip -t tee-simulator-plus-v1.0.0.zip
 
       - name: Upload module zip
@@ -141,12 +176,11 @@ jobs:
           body: |
             # TEE Simulator Plus
             
-            Tricky-Store ${{ env.TRICKY_STORE_VERSION }} (5ec1cff) + KSU WebUI manager.
+            **Source:** ${{ env.TRICKY_STORE_REPO }} @ ${{ env.TRICKY_STORE_REF }}
             
-            **Components:**
-            - Upstream Tricky-Store core (unmodified)
-            - KSU WebUI for keybox upload and target app management
-            - Latency profiler/diagnostics tool
+            **Patches applied:**
+            - Latency Equalizer (KeystoreInterceptor.kt) — adjusts attestation response timing to evade timing side-channel detection
             
-            **Credits:**
-            - Tricky-Store: https://github.com/5ec1cff/TrickyStore
+            **Added:**
+            - KSU WebUI for keybox / target / diagnostics / logs
+            - Configuration via `/data/adb/tricky_store/keybox.xml` and `target.txt`

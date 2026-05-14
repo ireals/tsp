@@ -400,8 +400,12 @@ async function handleTargetImport(event) {
 function initDiagnosticsPanel() {
   const runBtn = document.getElementById('btn-run-diagnostics');
   const calBtn = document.getElementById('btn-calibrate');
+  const saveEqBtn = document.getElementById('btn-save-equalizer');
   if (runBtn) runBtn.addEventListener('click', runDiagnostics);
   if (calBtn) calBtn.addEventListener('click', calibrateProfile);
+  if (saveEqBtn) saveEqBtn.addEventListener('click', saveEqualizerSettings);
+  // Auto-load equalizer settings
+  loadEqualizerSettings();
 }
 
 async function runDiagnostics() {
@@ -455,10 +459,51 @@ async function calibrateProfile() {
   try {
     const data = await execCommand('profiler_calibrate', { sampleCount });
     showSuccess(`キャリブレーション完了: 平均=${Number(data.meanMs || 0).toFixed(3)}ms, σ=${Number(data.stddevMs || 0).toFixed(3)}ms`);
+    // Auto-populate equalizer reference if user wants to use it
+    await loadEqualizerSettings();
   } catch (err) {
     showError(`キャリブレーション失敗: ${err.message}`);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'キャリブレーション'; }
+  }
+}
+
+// ============================================================
+// Latency Equalizer settings
+// ============================================================
+
+async function loadEqualizerSettings() {
+  try {
+    const data = await execCommand('equalizer_get');
+    const enableCb = document.getElementById('eq-enabled');
+    const refInput = document.getElementById('eq-reference');
+    const stdInput = document.getElementById('eq-stddev');
+    const thInput = document.getElementById('eq-threshold');
+    if (enableCb) enableCb.checked = !!data.enabled;
+    if (refInput) refInput.value = Number(data.referenceMs || 0).toFixed(3);
+    if (stdInput) stdInput.value = Number(data.stddevMs || 0).toFixed(3);
+    if (thInput) thInput.value = Number(data.detectionThreshold || 1.1).toFixed(2);
+  } catch (err) {
+    console.warn('[TSP] equalizer settings load failed:', err.message);
+  }
+}
+
+async function saveEqualizerSettings() {
+  const enabled = document.getElementById('eq-enabled').checked;
+  const referenceMs = parseFloat(document.getElementById('eq-reference').value) || 0;
+  const stddevMs = parseFloat(document.getElementById('eq-stddev').value) || 0;
+  const detectionThreshold = parseFloat(document.getElementById('eq-threshold').value) || 1.1;
+
+  try {
+    await execCommand('equalizer_set', {
+      enabled,
+      referenceMs,
+      stddevMs,
+      detectionThreshold
+    });
+    showSuccess('Latency Equalizerの設定を保存しました');
+  } catch (err) {
+    showError(`設定保存失敗: ${err.message}`);
   }
 }
 

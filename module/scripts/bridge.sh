@@ -14,7 +14,7 @@ fi
 TRICKY_STORE_DIR="/data/adb/tricky_store"
 
 # Whitelist
-WHITELIST="status_get keybox_get keybox_upload keybox_remove target_list_installed target_add target_remove target_import target_export profiler_run profiler_reference profiler_calibrate config_get config_set log_tail"
+WHITELIST="status_get keybox_get keybox_upload keybox_remove target_list_installed target_add target_remove target_import target_export profiler_run profiler_reference profiler_calibrate config_get config_set log_tail equalizer_get equalizer_set"
 
 # Extract a JSON string field
 _json_get_str() {
@@ -33,6 +33,7 @@ _resolve_backend() {
         status_get|keybox_*) echo "$MODDIR/scripts/keybox_manager.sh" ;;
         target_*)            echo "$MODDIR/scripts/target_manager.sh" ;;
         profiler_*)          echo "$MODDIR/scripts/latency_profiler.sh" ;;
+        equalizer_*)         echo "$MODDIR/scripts/equalizer_manager.sh" ;;
         config_*|log_*)      echo "$MODDIR/scripts/config_manager.sh" ;;
         *)                   echo "" ;;
     esac

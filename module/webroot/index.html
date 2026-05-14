@@ -100,6 +100,32 @@
         <h3 class="card-subtitle">診断結果</h3>
         <div class="diagnostics-results" id="diagnostics-results"></div>
       </div>
+      <div class="card">
+        <h2 class="card-title">Latency Equalizer</h2>
+        <p class="card-subtitle">attestation応答にwait時間を挿入してタイミング検知を回避</p>
+        <p class="card-subtitle">設定先: /data/adb/tricky_store/equalizer.conf</p>
+        <div class="diagnostics-controls">
+          <label class="toggle-row">
+            <input type="checkbox" id="eq-enabled">
+            <span>有効化</span>
+          </label>
+          <div class="input-group">
+            <label for="eq-reference">参照時間 (ms) - HW TEEの平均</label>
+            <input type="number" class="input-outlined" id="eq-reference" value="0" min="0" step="0.001">
+          </div>
+          <div class="input-group">
+            <label for="eq-stddev">標準偏差 (ms) - ジッター幅</label>
+            <input type="number" class="input-outlined" id="eq-stddev" value="0" min="0" step="0.001">
+          </div>
+          <div class="input-group">
+            <label for="eq-threshold">検知閾値 (1.01-2.0)</label>
+            <input type="number" class="input-outlined" id="eq-threshold" value="1.1" min="1.01" max="2.0" step="0.01">
+          </div>
+          <div class="diagnostics-buttons">
+            <button class="btn btn-filled" id="btn-save-equalizer" type="button">設定を保存</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Logs tab -->
