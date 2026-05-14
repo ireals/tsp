@@ -84,8 +84,23 @@ jobs:
 
       - name: Build TEESimulator module
         working-directory: teesimulator
+        env:
+          # Increase JVM heap and Metaspace to avoid OOM during R8/Lint
+          GRADLE_OPTS: "-Xmx4g -XX:MaxMetaspaceSize=2g -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2"
         run: |
           chmod +x gradlew
+          # Override gradle.properties with larger memory settings
+          {
+            echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=2g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
+            echo "org.gradle.daemon=false"
+            echo "org.gradle.parallel=false"
+            echo "org.gradle.workers.max=2"
+            echo "kotlin.daemon.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=1g"
+          } >> gradle.properties
+
+          echo "=== gradle.properties (final) ==="
+          cat gradle.properties
+
           # TEESimulator's gradle layout: app + stub. The module zip is built via a Gradle task.
           ./gradlew assembleRelease --stacktrace --no-daemon || \
             ./gradlew :app:assembleRelease --stacktrace --no-daemon
