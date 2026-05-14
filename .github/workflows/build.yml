@@ -154,17 +154,14 @@ jobs:
           fi
 
           # Append WebUI bootstrap to post-fs-data.sh (or service.sh if no post-fs-data)
-          BOOTSTRAP="
-# === TEE Simulator Plus initialization ===
-[ -d /data/adb/tricky_store ] || mkdir -p /data/adb/tricky_store
-[ -f /data/adb/tricky_store/target.txt ] || { echo '# Tricky-Store target list' > /data/adb/tricky_store/target.txt; chmod 644 /data/adb/tricky_store/target.txt; }
-"
-          if [ -f post-fs-data.sh ]; then
-            echo "$BOOTSTRAP" >> post-fs-data.sh
-          fi
-          if [ -f service.sh ]; then
-            echo "$BOOTSTRAP" >> service.sh
-          fi
+          # Use printf to avoid multiline strings that break YAML indentation.
+          for sh_file in post-fs-data.sh service.sh; do
+            if [ -f "$sh_file" ]; then
+              printf '\n# === TEE Simulator Plus initialization ===\n' >> "$sh_file"
+              printf '[ -d /data/adb/tricky_store ] || mkdir -p /data/adb/tricky_store\n' >> "$sh_file"
+              printf '[ -f /data/adb/tricky_store/target.txt ] || { echo "# Tricky-Store target list" > /data/adb/tricky_store/target.txt; chmod 644 /data/adb/tricky_store/target.txt; }\n' >> "$sh_file"
+            fi
+          done
 
           echo "=== Final structure ==="
           find . -maxdepth 3 -type f | sort
