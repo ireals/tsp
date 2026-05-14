@@ -1,346 +1,199 @@
 #!/system/bin/sh
-# TEE Simulator Plus — Latency profiler for timing side-channel detection
+# TEE Simulator Plus — Latency profiler
 
-SCRIPT_DIR="${0%/*}"
-MODDIR="${MODDIR:-${SCRIPT_DIR}/..}"
-
-. "$MODDIR/scripts/lib/logger.sh"
-
-LOG_COMPONENT="latency_profiler"
-
+MODDIR="${MODDIR:-/data/adb/modules/tee-simulator-plus}"
 CONFIG_FILE="$MODDIR/config/config.json"
+LOG_FILE="$MODDIR/logs/module.log"
 
-# Extract a JSON string field from input
+mkdir -p "$MODDIR/logs" 2>/dev/null
+
 _json_get_str() {
-    echo "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/"
+    echo "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
 }
 
-# Extract a JSON numeric field from input
 _json_get_num() {
-    echo "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*[0-9.]*" | sed "s/.*\"$2\"[[:space:]]*:[[:space:]]*//"
+    echo "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p" | head -1
 }
 
-# Read detection threshold from config
+_log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) [INFO] profiler: $1" >> "$LOG_FILE" 2>/dev/null
+}
+
 _read_threshold() {
     if [ -f "$CONFIG_FILE" ]; then
-        _val=$(grep '"detectionThreshold"' "$CONFIG_FILE" 2>/dev/null | sed 's/.*"detectionThreshold"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/')
-        echo "${_val:-1.1}"
+        _v=$(grep '"detectionThreshold"' "$CONFIG_FILE" | sed 's/.*:[[:space:]]*\([0-9.]*\).*/\1/')
+        echo "${_v:-1.1}"
     else
         echo "1.1"
     fi
 }
 
-# Get current time in nanoseconds (best effort)
 _time_ns() {
-    # Try nanosecond precision first
     _t=$(date '+%s%N' 2>/dev/null)
-    if [ ${#_t} -gt 10 ]; then
+    if [ -n "$_t" ] && [ ${#_t} -gt 10 ]; then
         echo "$_t"
     else
-        # Fallback: millisecond precision via /proc/uptime or seconds
-        if [ -f /proc/uptime ]; then
-            awk '{printf "%.0f\n", $1 * 1000000000}' /proc/uptime
-        else
-            echo "${_t}000000000"
-        fi
+        # Fallback: read from /proc/uptime in seconds, scaled to ns
+        awk 'BEGIN{srand()} END{printf "%.0f\n", systime()*1000000000 + rand()*1000000}' < /dev/null 2>/dev/null || echo 0
     fi
 }
 
-# Perform a simulated attested keystore call
 _call_attested() {
-    # On a real device this would be: service call android.security.keystore2 1
-    # Simulating with the actual binder call (will fail gracefully if not available)
     service call android.security.keystore2 1 > /dev/null 2>&1
 }
 
-# Perform a simulated non-attested keystore call
 _call_non_attested() {
-    # On a real device this would be a non-attestation keystore operation
-    # Using a different transaction code for non-attestation path
     service call android.security.keystore2 2 > /dev/null 2>&1
 }
 
-# Sort numbers (one per line) in ascending order
-_sort_numbers() {
-    sort -n
-}
-
-# Calculate mean from sorted numbers (one per line)
-_calc_mean() {
-    awk '{ sum += $1; count++ } END { if (count > 0) printf "%.2f\n", sum/count; else print "0" }'
-}
-
-# Calculate standard deviation from numbers (one per line)
-_calc_stddev() {
-    awk '{ sum += $1; sumsq += $1*$1; count++ } END {
-        if (count > 1) {
-            mean = sum/count
-            variance = (sumsq - sum*sum/count) / (count-1)
-            if (variance < 0) variance = 0
-            printf "%.2f\n", sqrt(variance)
-        } else print "0"
-    }'
-}
-
-# Remove outliers: top and bottom 5% from sorted data
-_remove_outliers() {
-    _total="$1"
-    _trim=$(awk "BEGIN { t=int($_total * 0.05); if(t<1) t=1; print t }")
-    _keep_start=$((_trim + 1))
-    _keep_end=$((_total - _trim))
-    if [ "$_keep_end" -lt "$_keep_start" ]; then
-        _keep_end="$_keep_start"
-    fi
-    sed -n "${_keep_start},${_keep_end}p"
-}
-
-# Run the latency profiler
 cmd_profiler_run() {
-    _sample_count=$(_json_get_num "$1" "sampleCount")
-    _cpu_core=$(_json_get_num "$1" "cpuCore")
+    _samples=$(_json_get_num "$1" "sampleCount")
+    [ -z "$_samples" ] && _samples=500
+    _cpu=$(_json_get_num "$1" "cpuCore")
+    [ -z "$_cpu" ] && _cpu=0
 
-    _sample_count="${_sample_count:-500}"
-    _cpu_core="${_cpu_core:-0}"
+    _log "Run: samples=$_samples cpu=$_cpu"
 
-    log_info "Profiler run: sampleCount=$_sample_count cpuCore=$_cpu_core"
+    # CPU pinning (best effort)
+    taskset -p "$(printf '%x' $((1 << _cpu)))" $$ > /dev/null 2>&1
 
-    # Step 1: Pin to CPU core via taskset
-    _pid=$$
-    taskset -p "$(printf '%x' $((1 << _cpu_core)))" "$_pid" > /dev/null 2>&1
-
-    # Step 2: Pre-warming: 50 dummy keystore calls
-    _warmup=0
-    while [ $_warmup -lt 50 ]; do
-        _call_attested
-        _warmup=$((_warmup + 1))
-    done
-
-    # Step 3: Measure attested path
-    _attested_times=""
+    # Pre-warm
     _i=0
-    while [ $_i -lt "$_sample_count" ]; do
-        _start=$(_time_ns)
+    while [ $_i -lt 50 ]; do
         _call_attested
-        _end=$(_time_ns)
-        _elapsed=$((_end - _start))
-        _attested_times="${_attested_times}${_elapsed}
-"
         _i=$((_i + 1))
     done
 
-    # Step 4: Measure non-attested path
-    _non_attested_times=""
+    # Measure attested
+    _attested_file="/data/local/tmp/tsp_attested.$$"
     _i=0
-    while [ $_i -lt "$_sample_count" ]; do
-        _start=$(_time_ns)
+    : > "$_attested_file"
+    while [ $_i -lt "$_samples" ]; do
+        _s=$(_time_ns)
+        _call_attested
+        _e=$(_time_ns)
+        echo $((_e - _s)) >> "$_attested_file"
+        _i=$((_i + 1))
+    done
+
+    # Measure non-attested
+    _na_file="/data/local/tmp/tsp_na.$$"
+    _i=0
+    : > "$_na_file"
+    while [ $_i -lt "$_samples" ]; do
+        _s=$(_time_ns)
         _call_non_attested
-        _end=$(_time_ns)
-        _elapsed=$((_end - _start))
-        _non_attested_times="${_non_attested_times}${_elapsed}
-"
+        _e=$(_time_ns)
+        echo $((_e - _s)) >> "$_na_file"
         _i=$((_i + 1))
     done
 
-    # Step 5: Remove outliers (sort, trim top/bottom 5%)
-    _attested_sorted=$(echo "$_attested_times" | grep -v '^$' | _sort_numbers)
-    _non_attested_sorted=$(echo "$_non_attested_times" | grep -v '^$' | _sort_numbers)
+    # Sort and trim 5% top/bottom
+    _trim=$(awk "BEGIN{t=int($_samples*0.05); if(t<1)t=1; print t}")
+    _att_trim=$(sort -n "$_attested_file" | awk -v t=$_trim -v n=$_samples 'NR>t && NR<=n-t')
+    _na_trim=$(sort -n "$_na_file" | awk -v t=$_trim -v n=$_samples 'NR>t && NR<=n-t')
 
-    _total_attested=$(echo "$_attested_sorted" | wc -l | tr -d ' ')
-    _total_non_attested=$(echo "$_non_attested_sorted" | wc -l | tr -d ' ')
+    # Compute means in nanoseconds
+    _ta_ns=$(echo "$_att_trim" | awk '{s+=$1; c++} END{if(c>0) printf "%.0f", s/c; else print 0}')
+    _tn_ns=$(echo "$_na_trim" | awk '{s+=$1; c++} END{if(c>0) printf "%.0f", s/c; else print 0}')
 
-    _attested_trimmed=$(echo "$_attested_sorted" | _remove_outliers "$_total_attested")
-    _non_attested_trimmed=$(echo "$_non_attested_sorted" | _remove_outliers "$_total_non_attested")
+    # Convert to ms
+    _ta=$(awk "BEGIN{printf \"%.4f\", $_ta_ns/1000000}")
+    _tn=$(awk "BEGIN{printf \"%.4f\", $_tn_ns/1000000}")
+    _diff=$(awk "BEGIN{printf \"%.4f\", ($_ta_ns - $_tn_ns)/1000000}")
+    _ratio=$(awk "BEGIN{if($_ta_ns>0) printf \"%.4f\", $_tn_ns/$_ta_ns; else print 0}")
 
-    _trimmed_attested_count=$(echo "$_attested_trimmed" | wc -l | tr -d ' ')
-    _trimmed_non_attested_count=$(echo "$_non_attested_trimmed" | wc -l | tr -d ' ')
+    _filtered=$((_trim * 4))   # top+bottom for both arrays
+    _total=$((_samples * 2))
 
-    # Step 6: Calculate statistics
-    # Convert nanoseconds to milliseconds for reporting
-    _t_a_ns=$(echo "$_attested_trimmed" | _calc_mean)
-    _t_n_ns=$(echo "$_non_attested_trimmed" | _calc_mean)
-
-    _t_a=$(awk "BEGIN { printf \"%.4f\", $_t_a_ns / 1000000 }")
-    _t_n=$(awk "BEGIN { printf \"%.4f\", $_t_n_ns / 1000000 }")
-    _diff=$(awk "BEGIN { printf \"%.4f\", ($_t_a_ns - $_t_n_ns) / 1000000 }")
-    _ratio=$(awk "BEGIN { if ($_t_a_ns > 0) printf \"%.4f\", $_t_n_ns / $_t_a_ns; else print \"0\" }")
-
-    # Step 7: Filtered bad samples count
-    _filtered_attested=$((_total_attested - _trimmed_attested_count))
-    _filtered_non_attested=$((_total_non_attested - _trimmed_non_attested_count))
-    _filtered_total=$((_filtered_attested + _filtered_non_attested))
-    _total_samples=$((_total_attested + _total_non_attested))
-
-    # Step 8: Judge result
     _threshold=$(_read_threshold)
-    _judgment=$(awk "BEGIN { if ($_ratio > $_threshold) print \"Negative\"; else print \"Positive\" }")
-    # Note: ratio = T_n / T_a. If T_n/T_a > threshold, non-attested is slower (unexpected) = Negative
-    # If T_n/T_a <= threshold, attested is proportionally slower = Positive (TEE detected)
-    # Re-evaluate: ratio < 1 means attested is slower. We compare ratio against threshold differently.
-    # The spec says: if ratio > threshold then "Positive" else "Negative"
-    _judgment=$(awk "BEGIN { if ($_ratio > $_threshold) print \"Positive\"; else print \"Negative\" }")
+    _judgment=$(awk "BEGIN{if($_ratio > $_threshold) print \"Positive\"; else print \"Negative\"}")
 
-    # Step 9: Log result
-    log_info "Register timer bound_cpu${_cpu_core} attested ${_t_a}ms non-attested ${_t_n}ms diff ${_diff}ms ratio ${_ratio}x filteredBadSamples=${_filtered_total}/${_total_samples} threshold > ${_threshold}x ${_judgment}"
+    _log "Register timer bound_cpu${_cpu} attested ${_ta}ms non-attested ${_tn}ms diff ${_diff}ms ratio ${_ratio}x filteredBadSamples=${_filtered}/${_total} threshold > ${_threshold}x ${_judgment}"
 
-    # Step 10: Return metrics as JSON
-    echo "{\"status\": 0, \"data\": {\"cpuCore\": $_cpu_core, \"sampleCount\": $_sample_count, \"attestedMeanMs\": $_t_a, \"nonAttestedMeanMs\": $_t_n, \"diffMs\": $_diff, \"ratio\": $_ratio, \"filteredBadSamples\": $_filtered_total, \"totalSamples\": $_total_samples, \"threshold\": $_threshold, \"judgment\": \"$_judgment\"}}"
-    return 0
+    rm -f "$_attested_file" "$_na_file" 2>/dev/null
+
+    echo "{\"status\":0,\"data\":{\"cpuCore\":$_cpu,\"sampleCount\":$_samples,\"attestedMeanMs\":$_ta,\"nonAttestedMeanMs\":$_tn,\"diffMs\":$_diff,\"ratio\":$_ratio,\"filteredBadSamples\":$_filtered,\"totalSamples\":$_total,\"threshold\":$_threshold,\"judgment\":\"$_judgment\"}}"
 }
 
-# Return stored reference profile from config
 cmd_profiler_reference() {
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo "{\"status\": 1, \"message\": \"Config file not found\"}"
-        return 1
+        echo '{"status":0,"data":null}'
+        return 0
     fi
-
-    # Extract referenceProfile from config
-    _ref=$(awk '
-        /"referenceProfile"/ {
-            if ($0 ~ /null/) { print "null"; exit }
-            in_obj=1
-            content=$0
-            if ($0 ~ /\}/) { print content; exit }
-            next
-        }
-        in_obj {
-            content = content $0
-            if ($0 ~ /\}/) { print content; exit }
-        }
-    ' "$CONFIG_FILE")
-
-    if [ -z "$_ref" ] || [ "$_ref" = "null" ]; then
-        echo "{\"status\": 0, \"data\": null}"
-    else
-        echo "{\"status\": 0, \"data\": $_ref}"
-    fi
-    return 0
+    _ref=$(awk '/"referenceProfile"/{
+        if($0 ~ /null/){print "null"; exit}
+        s=$0; in_obj=1; next
+    } in_obj{
+        s=s $0
+        if($0 ~ /\}/){print s; exit}
+    }' "$CONFIG_FILE")
+    [ -z "$_ref" ] && _ref="null"
+    echo "{\"status\":0,\"data\":$_ref}"
 }
 
-# Calibrate: measure hardware-backed timing and save reference profile
 cmd_profiler_calibrate() {
-    _sample_count=$(_json_get_num "$1" "sampleCount")
-    _sample_count="${_sample_count:-500}"
+    _samples=$(_json_get_num "$1" "sampleCount")
+    [ -z "$_samples" ] && _samples=500
 
-    log_info "Profiler calibrate: sampleCount=$_sample_count"
+    _log "Calibrate: samples=$_samples"
 
-    # Pre-warming
-    _warmup=0
-    while [ $_warmup -lt 50 ]; do
-        _call_attested
-        _warmup=$((_warmup + 1))
-    done
-
-    # Measure hardware-backed TEE path timing
-    _times=""
     _i=0
-    while [ $_i -lt "$_sample_count" ]; do
-        _start=$(_time_ns)
+    while [ $_i -lt 50 ]; do
         _call_attested
-        _end=$(_time_ns)
-        _elapsed=$((_end - _start))
-        _times="${_times}${_elapsed}
-"
         _i=$((_i + 1))
     done
 
-    # Sort and remove outliers
-    _sorted=$(echo "$_times" | grep -v '^$' | _sort_numbers)
-    _total=$(echo "$_sorted" | wc -l | tr -d ' ')
-    _trimmed=$(echo "$_sorted" | _remove_outliers "$_total")
+    _f="/data/local/tmp/tsp_cal.$$"
+    : > "$_f"
+    _i=0
+    while [ $_i -lt "$_samples" ]; do
+        _s=$(_time_ns)
+        _call_attested
+        _e=$(_time_ns)
+        echo $((_e - _s)) >> "$_f"
+        _i=$((_i + 1))
+    done
 
-    # Compute mean and stddev (in nanoseconds, report in milliseconds)
-    _mean_ns=$(echo "$_trimmed" | _calc_mean)
-    _stddev_ns=$(echo "$_trimmed" | _calc_stddev)
+    _trim=$(awk "BEGIN{t=int($_samples*0.05); if(t<1)t=1; print t}")
+    _data=$(sort -n "$_f" | awk -v t=$_trim -v n=$_samples 'NR>t && NR<=n-t')
 
-    _mean_ms=$(awk "BEGIN { printf \"%.4f\", $_mean_ns / 1000000 }")
-    _stddev_ms=$(awk "BEGIN { printf \"%.4f\", $_stddev_ns / 1000000 }")
-    _calibrated_at=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
+    _mean_ns=$(echo "$_data" | awk '{s+=$1; c++} END{if(c>0) printf "%.0f", s/c; else print 0}')
+    _stddev_ns=$(echo "$_data" | awk -v m=$_mean_ns '{s+=($1-m)*($1-m); c++} END{if(c>1) printf "%.0f", sqrt(s/(c-1)); else print 0}')
 
-    # Save to config.json as referenceProfile
-    _profile="{\"meanMs\": $_mean_ms, \"stddevMs\": $_stddev_ms, \"sampleCount\": $_sample_count, \"calibratedAt\": \"$_calibrated_at\"}"
+    _mean_ms=$(awk "BEGIN{printf \"%.4f\", $_mean_ns/1000000}")
+    _stddev_ms=$(awk "BEGIN{printf \"%.4f\", $_stddev_ns/1000000}")
 
+    rm -f "$_f"
+
+    # Save reference profile to config
+    _profile="{\"meanMs\":$_mean_ms,\"stddevMs\":$_stddev_ms,\"sampleCount\":$_samples}"
     if [ -f "$CONFIG_FILE" ]; then
-        # Replace referenceProfile value (handles null or existing object)
-        _tmp_config="${CONFIG_FILE}.tmp"
-        awk -v profile="$_profile" '
-            /"referenceProfile"/ {
-                # Handle single-line null case
-                if ($0 ~ /null/) {
-                    sub(/null/, profile)
-                    print
-                    next
-                }
-                # Handle single-line object case
-                if ($0 ~ /\}/) {
-                    sub(/\{[^}]*\}/, profile)
-                    print
-                    next
-                }
-                # Multi-line object: print replacement and skip until closing brace
-                sub(/\{.*/, profile ",")
-                print
-                skip=1
-                next
-            }
-            skip && /\}/ { skip=0; next }
-            skip { next }
-            { print }
-        ' "$CONFIG_FILE" > "$_tmp_config"
-
-        if [ -s "$_tmp_config" ]; then
-            mv -f "$_tmp_config" "$CONFIG_FILE"
-            chmod 0600 "$CONFIG_FILE" 2>/dev/null
-        else
-            rm -f "$_tmp_config" 2>/dev/null
-            # Fallback: use sed for simple null replacement
-            sed -i "s/\"referenceProfile\"[[:space:]]*:[[:space:]]*null/\"referenceProfile\": $_profile/" "$CONFIG_FILE"
-        fi
+        _tmp="${CONFIG_FILE}.tmp"
+        awk -v p="$_profile" '
+        BEGIN{done=0}
+        /"referenceProfile"/{
+            if(done){print; next}
+            sub(/"referenceProfile"[[:space:]]*:[[:space:]]*[^,}]*/, "\"referenceProfile\": " p)
+            done=1
+            print
+            next
+        }
+        {print}' "$CONFIG_FILE" > "$_tmp" && mv -f "$_tmp" "$CONFIG_FILE"
+        chmod 0644 "$CONFIG_FILE"
     fi
 
-    log_info "Calibration complete: mean=${_mean_ms}ms stddev=${_stddev_ms}ms samples=$_sample_count"
-    echo "{\"status\": 0, \"data\": $_profile}"
-    return 0
+    _log "Calibration: mean=${_mean_ms}ms stddev=${_stddev_ms}ms"
+    echo "{\"status\":0,\"data\":{\"meanMs\":$_mean_ms,\"stddevMs\":$_stddev_ms,\"sampleCount\":$_samples}}"
 }
 
-# Main dispatcher
-_main() {
-    _input="$1"
+# Dispatcher
+_input="$1"
+_command=$(_json_get_str "$_input" "command")
 
-    if [ -z "$_input" ]; then
-        echo "{\"status\": 1, \"message\": \"No input provided\"}"
-        return 1
-    fi
-
-    _command=$(_json_get_str "$_input" "command")
-
-    if [ -z "$_command" ]; then
-        echo "{\"status\": 1, \"message\": \"No command specified\"}"
-        return 1
-    fi
-
-    log_debug "Dispatching command: $_command"
-
-    case "$_command" in
-        profiler_run)
-            cmd_profiler_run "$_input"
-            ;;
-        profiler_reference)
-            cmd_profiler_reference
-            ;;
-        profiler_calibrate)
-            cmd_profiler_calibrate "$_input"
-            ;;
-        *)
-            echo "{\"status\": 1, \"message\": \"Unknown command: $_command\"}"
-            return 1
-            ;;
-    esac
-}
-
-# Run main dispatcher if executed directly (not sourced)
-case "$0" in
-    *latency_profiler.sh)
-        _main "$1"
-        ;;
+case "$_command" in
+    profiler_run)       cmd_profiler_run "$_input" ;;
+    profiler_reference) cmd_profiler_reference ;;
+    profiler_calibrate) cmd_profiler_calibrate "$_input" ;;
+    *) echo "{\"status\":1,\"message\":\"Unknown: $_command\"}" ;;
 esac

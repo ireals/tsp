@@ -80,8 +80,9 @@ jobs:
       - name: Upload module zip
         uses: actions/upload-artifact@v4
         with:
-          name: tee-simulator-plus-module
+          name: tee-simulator-plus-EXTRACT-INNER-ZIP
           path: tee-simulator-plus-v1.0.0.zip
+          compression-level: 0
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')

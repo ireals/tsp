@@ -1,288 +1,161 @@
 /**
- * TEE Simulator Plus — Main WebUI JavaScript
- * Handles KSU bridge communication, tab navigation, and UI state.
- * No external dependencies.
+ * TEE Simulator Plus — WebUI
+ * KSU WebUI exec API uses callback-based async (matches Tricky-Addon pattern)
  */
 
 'use strict';
 
-// ============================================================
-// Constants
-// ============================================================
-
-/** Whitelist of allowed commands — must match bridge.sh WHITELIST */
-const COMMAND_WHITELIST = [
-  'keybox_add',
-  'keybox_list',
-  'keybox_select',
-  'keybox_delete',
-  'keybox_validate',
-  'target_list_installed',
-  'target_add',
-  'target_remove',
-  'target_import',
-  'target_export',
-  'profiler_run',
-  'profiler_reference',
-  'profiler_calibrate',
-  'config_get',
-  'config_set',
-  'log_tail'
-];
-
-/** Path to bridge.sh on device */
-const BRIDGE_SCRIPT = '/data/adb/modules/tee_simulator_plus/scripts/bridge.sh';
-
-/** Duration (ms) for toast notifications */
-const TOAST_DURATION = 3000;
+const MODULE_DIR = '/data/adb/modules/tee-simulator-plus';
+const BRIDGE_SCRIPT = `${MODULE_DIR}/scripts/bridge.sh`;
+const TRICKY_STORE_DIR = '/data/adb/tricky_store';
 
 // ============================================================
-// KSU API Detection & Mock
+// KSU exec wrapper — callback-based async API
 // ============================================================
 
 /**
- * Detect KSU WebUI API availability.
- * In development mode (no ksu object), provide a console-logging mock.
+ * Execute a shell command via KSU WebUI exec API.
+ * Uses the callback-based pattern matching Tricky-Addon and modern KSU.
  */
-function initKsuApi() {
-  if (typeof window.ksu !== 'undefined') {
-    // Running inside KernelSU WebUI — enable fullscreen
-    try {
-      window.ksu.fullScreen(true);
-    } catch (e) {
-      console.warn('[TSP] fullScreen not supported:', e);
+function ksuExec(command) {
+  return new Promise((resolve, reject) => {
+    if (typeof ksu === 'undefined' || typeof ksu.exec !== 'function') {
+      // Development fallback
+      console.log('[TSP Mock] exec:', command);
+      resolve({ errno: 0, stdout: '{"status":0,"data":null}', stderr: '' });
+      return;
     }
-    return;
-  }
 
-  // Development mock — logs commands to console
-  console.info('[TSP] KSU API not detected, using development mock');
-  window.ksu = {
-    exec: function (script, input) {
-      console.log('[TSP Mock] exec:', script, input);
-      // Return a simulated empty success response
-      return JSON.stringify({ status: 0, data: null, message: 'mock' });
-    },
-    fullScreen: function (enabled) {
-      console.log('[TSP Mock] fullScreen:', enabled);
+    const callbackName = `tsp_cb_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+    window[callbackName] = (errno, stdout, stderr) => {
+      try {
+        delete window[callbackName];
+      } catch (e) {}
+      resolve({ errno, stdout: stdout || '', stderr: stderr || '' });
+    };
+
+    try {
+      ksu.exec(command, '{}', callbackName);
+    } catch (e) {
+      try { delete window[callbackName]; } catch (_) {}
+      reject(e);
     }
-  };
+  });
 }
 
-// ============================================================
-// Command Execution
-// ============================================================
-
 /**
- * Execute a command through the KSU bridge.
- * Validates against the whitelist, builds JSON input, and parses the response.
- *
- * @param {string} command — Command name (must be in COMMAND_WHITELIST)
- * @param {object} [params={}] — Optional parameters for the command
- * @returns {Promise<any>} — Resolved data field from the bridge response
- * @throws {Error} If command is not whitelisted or bridge returns an error
+ * Run a bridge command. Returns the parsed `data` field.
  */
 async function execCommand(command, params = {}) {
-  // Validate command against whitelist
-  if (!COMMAND_WHITELIST.includes(command)) {
-    throw new Error(`Command not allowed: ${command}`);
-  }
-
-  // Build JSON input matching bridge.sh expected format
   const input = JSON.stringify({ command, params });
+  // Single-quote-escape input for shell
+  const escaped = input.replace(/'/g, `'\\''`);
+  const cmdline = `sh ${BRIDGE_SCRIPT} '${escaped}'`;
 
-  let rawResponse;
+  let result;
   try {
-    rawResponse = window.ksu.exec(BRIDGE_SCRIPT, input);
+    result = await ksuExec(cmdline);
   } catch (e) {
-    throw new Error(`Bridge execution failed: ${e.message || e}`);
+    throw new Error(`Bridge exec failed: ${e.message || e}`);
   }
 
-  // Parse response JSON
-  let response;
+  const stdout = (result.stdout || '').trim();
+  if (!stdout) {
+    if (result.stderr) {
+      throw new Error(`Bridge stderr: ${result.stderr.trim()}`);
+    }
+    throw new Error('Empty response from bridge');
+  }
+
+  let parsed;
   try {
-    response = JSON.parse(rawResponse);
+    parsed = JSON.parse(stdout);
   } catch (e) {
-    throw new Error(`Invalid response from bridge: ${rawResponse}`);
+    throw new Error(`Invalid bridge response: ${stdout.substring(0, 200)}`);
   }
 
-  // Check status
-  if (response.status !== 0) {
-    throw new Error(response.message || `Command failed with status ${response.status}`);
+  if (parsed.status !== 0) {
+    throw new Error(parsed.message || `Bridge returned status ${parsed.status}`);
   }
-
-  return response.data;
+  return parsed.data;
 }
 
 // ============================================================
-// Utility Functions
+// Toast notifications
 // ============================================================
 
-/**
- * Display an error toast notification.
- * @param {string} message — Error message to display
- */
-function showError(message) {
-  showToast(message, 'error');
-}
-
-/**
- * Display a success toast notification.
- * @param {string} message — Success message to display
- */
-function showSuccess(message) {
-  showToast(message, 'success');
-}
-
-/**
- * Internal toast display helper.
- * Creates a temporary notification element and auto-removes it.
- * @param {string} message — Text to display
- * @param {'error'|'success'} type — Toast type for styling
- */
-function showToast(message, type) {
-  // Remove any existing toast
+function showToast(message, type = 'info') {
   const existing = document.querySelector('.toast');
-  if (existing) {
-    existing.remove();
-  }
+  if (existing) existing.remove();
 
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
-  toast.setAttribute('role', 'alert');
-  toast.setAttribute('aria-live', 'polite');
   toast.textContent = message;
-
   document.body.appendChild(toast);
-
-  // Trigger reflow for CSS transition
   void toast.offsetWidth;
   toast.classList.add('toast-visible');
 
-  // Auto-dismiss
   setTimeout(() => {
     toast.classList.remove('toast-visible');
-    toast.addEventListener('transitionend', () => toast.remove(), { once: true });
-    // Fallback removal if transition doesn't fire
-    setTimeout(() => toast.remove(), 500);
-  }, TOAST_DURATION);
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
 }
 
-/**
- * Format an ISO timestamp string for display.
- * @param {string} isoString — ISO 8601 date string
- * @returns {string} Formatted date string (locale-aware)
- */
-function formatTimestamp(isoString) {
-  if (!isoString) return '—';
-  try {
-    const date = new Date(isoString);
-    if (isNaN(date.getTime())) return isoString;
-    return date.toLocaleString('ja-JP', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-  } catch (e) {
-    return isoString;
-  }
+const showError = (msg) => showToast(msg, 'error');
+const showSuccess = (msg) => showToast(msg, 'success');
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = String(str ?? '');
+  return div.innerHTML;
 }
 
 // ============================================================
-// Status Panel
+// Status panel
 // ============================================================
 
-/**
- * Fetch module configuration and update the status panel.
- * Populates: module status indicator, active keybox name, target count.
- */
 async function loadStatus() {
-  const statusIndicator = document.getElementById('module-status-indicator');
-  const statusText = document.getElementById('module-status-text');
-  const activeKeyboxEl = document.getElementById('active-keybox-name');
+  const indicator = document.getElementById('module-status-indicator');
+  const text = document.getElementById('module-status-text');
+  const keyboxEl = document.getElementById('active-keybox-name');
   const targetCountEl = document.getElementById('target-count');
 
   try {
-    const config = await execCommand('config_get', {});
-
-    // Module status — active if config loads successfully
-    if (statusIndicator) {
-      statusIndicator.classList.add('active');
-    }
-    if (statusText) {
-      statusText.textContent = 'Active';
-    }
-
-    // Active keybox name
-    if (activeKeyboxEl) {
-      if (config && config.activeKeyboxId) {
-        // Try to find the keybox name from metadata
-        const meta = (config.keyboxMetadata || []).find(
-          (k) => k.id === config.activeKeyboxId
-        );
-        activeKeyboxEl.textContent = meta ? meta.name : config.activeKeyboxId;
-      } else {
-        activeKeyboxEl.textContent = '未設定';
-      }
-    }
-
-    // Target count
-    if (targetCountEl) {
-      const targets = config && config.targetList ? config.targetList : [];
-      targetCountEl.textContent = String(targets.length);
-    }
+    const status = await execCommand('status_get');
+    if (indicator) indicator.classList.add('active');
+    if (text) text.textContent = '有効';
+    if (keyboxEl) keyboxEl.textContent = status.keyboxPresent ? (status.keyboxName || 'keybox.xml') : '未設定';
+    if (targetCountEl) targetCountEl.textContent = String(status.targetCount || 0);
   } catch (e) {
-    // Module may not be running or bridge unavailable
-    console.warn('[TSP] Failed to load status:', e);
-    if (statusIndicator) {
-      statusIndicator.classList.add('inactive');
-    }
-    if (statusText) {
-      statusText.textContent = 'Inactive';
-    }
-    if (activeKeyboxEl) {
-      activeKeyboxEl.textContent = '—';
-    }
-    if (targetCountEl) {
-      targetCountEl.textContent = '0';
-    }
+    console.warn('[TSP] status load failed:', e.message);
+    if (indicator) indicator.classList.remove('active');
+    if (text) text.textContent = '読込失敗';
+    if (keyboxEl) keyboxEl.textContent = '—';
+    if (targetCountEl) targetCountEl.textContent = '0';
   }
 }
 
 // ============================================================
-// Tab Switching
+// Tab switching
 // ============================================================
 
-/**
- * Initialize tab navigation.
- * Handles active state, aria attributes, and panel visibility.
- */
 function initTabs() {
-  const tabButtons = document.querySelectorAll('[role="tab"]');
-  const tabPanels = document.querySelectorAll('[role="tabpanel"]');
+  const tabs = document.querySelectorAll('[role="tab"]');
+  const panels = document.querySelectorAll('[role="tabpanel"]');
 
-  tabButtons.forEach((button) => {
-    button.addEventListener('click', () => {
-      // Deactivate all tabs
-      tabButtons.forEach((btn) => {
-        btn.classList.remove('active');
-        btn.setAttribute('aria-selected', 'false');
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      tabs.forEach((t) => {
+        t.classList.remove('active');
+        t.setAttribute('aria-selected', 'false');
       });
-
-      // Hide all panels
-      tabPanels.forEach((panel) => {
-        panel.classList.remove('active');
-        panel.setAttribute('hidden', '');
+      panels.forEach((p) => {
+        p.classList.remove('active');
+        p.setAttribute('hidden', '');
       });
-
-      // Activate clicked tab
-      button.classList.add('active');
-      button.setAttribute('aria-selected', 'true');
-
-      // Show corresponding panel
-      const panelId = button.getAttribute('aria-controls');
+      tab.classList.add('active');
+      tab.setAttribute('aria-selected', 'true');
+      const panelId = tab.getAttribute('aria-controls');
       const panel = document.getElementById(panelId);
       if (panel) {
         panel.classList.add('active');
@@ -293,583 +166,357 @@ function initTabs() {
 }
 
 // ============================================================
-// Keybox List
+// Keybox panel — single keybox at /data/adb/tricky_store/keybox.xml
 // ============================================================
 
-/**
- * Load and render the keybox list in the Keybox tab.
- */
-async function loadKeyboxList() {
-  const listEl = document.getElementById('keybox-list');
-  if (!listEl) return;
-
-  listEl.innerHTML = '<p class="loading">読み込み中...</p>';
-
-  try {
-    const data = await execCommand('keybox_list', {});
-    const keyboxes = Array.isArray(data) ? data : [];
-
-    if (keyboxes.length === 0) {
-      listEl.innerHTML = '<p class="empty-state">Keyboxが登録されていません</p>';
-      return;
-    }
-
-    listEl.innerHTML = keyboxes
-      .map(
-        (kb) => `
-        <div class="keybox-item${kb.active ? ' keybox-active' : ''}" data-id="${kb.id}">
-          <div class="keybox-info">
-            <span class="keybox-name">${escapeHtml(kb.name || kb.id)}</span>
-            <span class="keybox-meta">${formatTimestamp(kb.addedAt)}</span>
-          </div>
-          <div class="keybox-actions">
-            ${
-              !kb.active
-                ? `<button class="btn btn-small btn-outlined" data-action="select" data-id="${kb.id}" aria-label="選択">選択</button>`
-                : '<span class="badge badge-active">使用中</span>'
-            }
-            <button class="btn btn-small btn-danger" data-action="delete" data-id="${kb.id}" aria-label="削除">削除</button>
-          </div>
-        </div>`
-      )
-      .join('');
-  } catch (e) {
-    listEl.innerHTML = `<p class="error-state">読み込みに失敗しました: ${escapeHtml(e.message)}</p>`;
-  }
-}
-
-/**
- * Escape HTML special characters to prevent XSS.
- * @param {string} str — Raw string
- * @returns {string} Escaped string safe for innerHTML
- */
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
-}
-
-// ============================================================
-// Initialization
-// ============================================================
-
-document.addEventListener('DOMContentLoaded', async () => {
-  // Detect and initialize KSU API (or mock)
-  initKsuApi();
-
-  // Set up tab navigation
-  initTabs();
-
-  // Load module status
-  await loadStatus();
-
-  // Load initial keybox list
-  await loadKeyboxList();
-});
-
-// ============================================================
-// Task 17: Keybox Panel
-// ============================================================
-
-/**
- * Initialize the Keybox panel — upload button, file input, and delegated actions.
- */
 function initKeyboxPanel() {
-  const uploadBtn = document.getElementById('keybox-upload-btn');
-  const fileInput = document.getElementById('keybox-file-input');
-  const listEl = document.getElementById('keybox-list');
+  const uploadBtn = document.getElementById('btn-upload-keybox');
+  const fileInput = document.getElementById('input-keybox-file');
+  const removeBtn = document.getElementById('btn-remove-keybox');
 
-  // Upload button triggers hidden file input
   if (uploadBtn && fileInput) {
-    uploadBtn.addEventListener('click', () => {
+    uploadBtn.addEventListener('click', (e) => {
+      e.preventDefault();
       fileInput.click();
     });
-
     fileInput.addEventListener('change', handleKeyboxUpload);
   }
 
-  // Delegate click events on keybox list for select/delete
-  if (listEl) {
-    listEl.addEventListener('click', async (e) => {
-      const btn = e.target.closest('[data-action]');
-      if (!btn) return;
-
-      const action = btn.getAttribute('data-action');
-      const id = btn.getAttribute('data-id');
-
-      if (action === 'select') {
-        try {
-          await execCommand('keybox_select', { id });
-          await loadKeyboxList();
-          await loadStatus();
-          showSuccess('Keyboxを選択しました');
-        } catch (err) {
-          showError(`選択に失敗しました: ${err.message}`);
-        }
-      } else if (action === 'delete') {
-        const confirmed = confirm('このKeyboxを削除しますか？');
-        if (!confirmed) return;
-
-        try {
-          await execCommand('keybox_delete', { id });
-          await loadKeyboxList();
-          await loadStatus();
-          showSuccess('Keyboxを削除しました');
-        } catch (err) {
-          showError(`削除に失敗しました: ${err.message}`);
-        }
-      }
-    });
+  if (removeBtn) {
+    removeBtn.addEventListener('click', handleKeyboxRemove);
   }
 }
 
-/**
- * Handle keybox file upload.
- * Reads the selected file and sends it to the bridge for import.
- * @param {Event} event — File input change event
- */
 async function handleKeyboxUpload(event) {
-  const file = event.target.files[0];
+  const file = event.target.files && event.target.files[0];
   if (!file) return;
 
+  const uploadBtn = document.getElementById('btn-upload-keybox');
+  if (uploadBtn) uploadBtn.disabled = true;
+
   try {
-    const reader = new FileReader();
+    // Read file as text
     const content = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(new Error('ファイルの読み込みに失敗しました'));
+      reader.onerror = () => reject(new Error('ファイル読み込み失敗'));
       reader.readAsText(file);
     });
 
-    const displayName = file.name.replace(/\.[^.]+$/, '');
-    await execCommand('keybox_add', { path: file.name, displayName, content });
-    await loadKeyboxList();
-    showSuccess(`Keybox "${displayName}" を追加しました`);
-  } catch (err) {
-    showError(`アップロードに失敗しました: ${err.message}`);
-  }
-
-  // Reset file input so the same file can be re-selected
-  event.target.value = '';
-}
-
-// ============================================================
-// Task 18: Target Panel
-// ============================================================
-
-/**
- * Initialize the Target panel — search, import/export, and app list.
- */
-function initTargetPanel() {
-  const searchInput = document.getElementById('target-search-input');
-  const importBtn = document.getElementById('target-import-btn');
-  const exportBtn = document.getElementById('target-export-btn');
-  const importFileInput = document.getElementById('target-import-file');
-
-  if (searchInput) {
-    searchInput.addEventListener('input', (e) => {
-      handleTargetSearch(e.target.value);
-    });
-  }
-
-  if (importBtn) {
-    importBtn.addEventListener('click', () => {
-      if (importFileInput) {
-        importFileInput.click();
-      } else {
-        handleTargetImport();
-      }
-    });
-  }
-
-  if (importFileInput) {
-    importFileInput.addEventListener('change', handleTargetImport);
-  }
-
-  if (exportBtn) {
-    exportBtn.addEventListener('click', handleTargetExport);
-  }
-
-  // Load initial target list
-  loadTargetList();
-}
-
-/**
- * Load and render the installed app list with target toggle switches.
- */
-async function loadTargetList() {
-  const listEl = document.getElementById('target-list');
-  if (!listEl) return;
-
-  listEl.innerHTML = '<p class="loading">アプリ一覧を読み込み中...</p>';
-
-  try {
-    const data = await execCommand('target_list_installed', {});
-    const apps = Array.isArray(data) ? data : [];
-
-    if (apps.length === 0) {
-      listEl.innerHTML = '<p class="empty-state">インストール済みアプリが見つかりません</p>';
-      return;
+    // Write to a tmp location, then call upload (which validates and moves)
+    const tmpPath = `/data/local/tmp/tsp_upload_${Date.now()}.xml`;
+    // Use base64 to avoid shell escaping issues
+    const b64 = btoa(unescape(encodeURIComponent(content)));
+    const writeCmd = `echo '${b64}' | base64 -d > '${tmpPath}' && chmod 644 '${tmpPath}'`;
+    const writeRes = await ksuExec(writeCmd);
+    if (writeRes.errno !== 0) {
+      throw new Error('一時ファイル書き込み失敗: ' + (writeRes.stderr || writeRes.errno));
     }
 
-    listEl.innerHTML = apps
-      .map(
-        (app) => `
-        <div class="target-item" data-package="${escapeHtml(app.packageName)}" data-name="${escapeHtml(app.appName || app.packageName)}">
-          <div class="target-info">
-            <span class="target-app-name">${escapeHtml(app.appName || app.packageName)}</span>
-            <span class="target-package-name">${escapeHtml(app.packageName)}</span>
-          </div>
-          <label class="toggle-switch">
-            <input type="checkbox" class="target-toggle" data-package="${escapeHtml(app.packageName)}" ${app.isTarget ? 'checked' : ''}>
-            <span class="toggle-slider"></span>
-          </label>
-        </div>`
-      )
-      .join('');
+    await execCommand('keybox_upload', { path: tmpPath, displayName: file.name });
 
-    // Attach toggle event listeners
-    listEl.querySelectorAll('.target-toggle').forEach((toggle) => {
-      toggle.addEventListener('change', (e) => {
-        const packageName = e.target.getAttribute('data-package');
-        handleTargetToggle(packageName, e.target.checked);
-      });
-    });
-  } catch (e) {
-    listEl.innerHTML = `<p class="error-state">読み込みに失敗しました: ${escapeHtml(e.message)}</p>`;
-  }
-}
+    // Cleanup tmp
+    await ksuExec(`rm -f '${tmpPath}'`);
 
-/**
- * Handle toggling an app's target state.
- * @param {string} packageName — Package name of the app
- * @param {boolean} isTarget — Whether the app should be a target
- */
-async function handleTargetToggle(packageName, isTarget) {
-  try {
-    if (isTarget) {
-      await execCommand('target_add', { packageName });
-    } else {
-      await execCommand('target_remove', { packageName });
-    }
+    showSuccess(`Keybox "${file.name}" を保存しました`);
+    await loadKeyboxInfo();
     await loadStatus();
   } catch (err) {
-    showError(`ターゲット変更に失敗しました: ${err.message}`);
-    // Revert the toggle visually
-    const toggle = document.querySelector(`.target-toggle[data-package="${packageName}"]`);
-    if (toggle) {
-      toggle.checked = !isTarget;
-    }
+    showError(`アップロード失敗: ${err.message}`);
+  } finally {
+    if (uploadBtn) uploadBtn.disabled = false;
+    event.target.value = '';
   }
 }
 
-/**
- * Filter displayed app items by partial match on package name or app name.
- * @param {string} query — Search query string
- */
-function handleTargetSearch(query) {
-  const items = document.querySelectorAll('.target-item');
-  const lowerQuery = query.toLowerCase().trim();
+async function handleKeyboxRemove() {
+  if (!confirm('Keyboxを削除しますか?')) return;
+  try {
+    await execCommand('keybox_remove');
+    showSuccess('Keyboxを削除しました');
+    await loadKeyboxInfo();
+    await loadStatus();
+  } catch (err) {
+    showError(`削除失敗: ${err.message}`);
+  }
+}
 
-  items.forEach((item) => {
-    const packageName = (item.getAttribute('data-package') || '').toLowerCase();
-    const appName = (item.getAttribute('data-name') || '').toLowerCase();
+async function loadKeyboxInfo() {
+  const infoEl = document.getElementById('keybox-info');
+  if (!infoEl) return;
+  infoEl.innerHTML = '<p class="loading">読み込み中...</p>';
 
-    if (!lowerQuery || packageName.includes(lowerQuery) || appName.includes(lowerQuery)) {
-      item.style.display = '';
-    } else {
-      item.style.display = 'none';
+  try {
+    const data = await execCommand('keybox_get');
+    if (!data || !data.present) {
+      infoEl.innerHTML = '<p class="empty-state">Keyboxが設定されていません。アップロードしてください。</p>';
+      return;
     }
+    infoEl.innerHTML = `
+      <div class="keybox-item active">
+        <div class="keybox-info">
+          <div class="keybox-name">${escapeHtml(data.displayName || 'keybox.xml')}</div>
+          <div class="keybox-detail">アルゴリズム: ${escapeHtml(data.algorithm || '不明')}</div>
+          <div class="keybox-detail">サブジェクト: ${escapeHtml(data.certificateSubject || '不明')}</div>
+          <div class="keybox-detail">ハッシュ: ${escapeHtml((data.hash || '').substring(0, 16))}...</div>
+          <div class="keybox-detail">パス: ${escapeHtml(data.path || '')}</div>
+        </div>
+        <div class="keybox-actions">
+          <button class="btn btn-outlined" id="btn-remove-keybox">削除</button>
+        </div>
+      </div>
+    `;
+    const removeBtn = document.getElementById('btn-remove-keybox');
+    if (removeBtn) removeBtn.addEventListener('click', handleKeyboxRemove);
+  } catch (err) {
+    infoEl.innerHTML = `<p class="error-state">読み込み失敗: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+// ============================================================
+// Target panel — uses /data/adb/tricky_store/target.txt
+// ============================================================
+
+let _allApps = [];
+
+function initTargetPanel() {
+  const search = document.getElementById('input-target-search');
+  if (search) {
+    search.addEventListener('input', (e) => filterTargets(e.target.value));
+  }
+  const exportBtn = document.getElementById('btn-export-targets');
+  if (exportBtn) exportBtn.addEventListener('click', handleTargetExport);
+  const importBtn = document.getElementById('btn-import-targets');
+  if (importBtn) importBtn.addEventListener('click', () => {
+    const fi = document.getElementById('input-import-file');
+    if (fi) fi.click();
+  });
+  const importFile = document.getElementById('input-import-file');
+  if (importFile) importFile.addEventListener('change', handleTargetImport);
+}
+
+async function loadTargetList() {
+  const listEl = document.getElementById('app-list');
+  if (!listEl) return;
+  listEl.innerHTML = '<p class="loading">アプリ一覧読み込み中...</p>';
+
+  try {
+    const data = await execCommand('target_list_installed');
+    _allApps = Array.isArray(data) ? data : [];
+    renderAppList(_allApps);
+  } catch (err) {
+    listEl.innerHTML = `<p class="error-state">読み込み失敗: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderAppList(apps) {
+  const listEl = document.getElementById('app-list');
+  if (!listEl) return;
+  if (apps.length === 0) {
+    listEl.innerHTML = '<p class="empty-state">アプリが見つかりません</p>';
+    return;
+  }
+  listEl.innerHTML = apps.map((app) => `
+    <div class="app-item" data-package="${escapeHtml(app.packageName)}" data-name="${escapeHtml((app.appName || app.packageName).toLowerCase())}">
+      <div class="app-item-info">
+        <div class="app-item-name">${escapeHtml(app.appName || app.packageName)}</div>
+        <div class="app-item-package">${escapeHtml(app.packageName)}</div>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" data-pkg="${escapeHtml(app.packageName)}" ${app.isTarget ? 'checked' : ''}>
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+  `).join('');
+  listEl.querySelectorAll('input[type=checkbox]').forEach((cb) => {
+    cb.addEventListener('change', (e) => {
+      handleTargetToggle(e.target.getAttribute('data-pkg'), e.target.checked);
+    });
   });
 }
 
-/**
- * Import targets from a target.txt file.
- * @param {Event} [event] — File input change event (optional)
- */
-async function handleTargetImport(event) {
-  let content = null;
+function filterTargets(query) {
+  const q = (query || '').toLowerCase().trim();
+  if (!q) { renderAppList(_allApps); return; }
+  renderAppList(_allApps.filter((app) =>
+    app.packageName.toLowerCase().includes(q) ||
+    (app.appName || '').toLowerCase().includes(q)
+  ));
+}
 
-  if (event && event.target && event.target.files && event.target.files[0]) {
-    const file = event.target.files[0];
-    const reader = new FileReader();
-    content = await new Promise((resolve, reject) => {
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(new Error('ファイルの読み込みに失敗しました'));
-      reader.readAsText(file);
-    });
-    event.target.value = '';
-  }
-
+async function handleTargetToggle(pkg, isTarget) {
   try {
-    await execCommand('target_import', { path: 'target.txt', content });
-    await loadTargetList();
+    if (isTarget) await execCommand('target_add', { packageName: pkg });
+    else await execCommand('target_remove', { packageName: pkg });
     await loadStatus();
-    showSuccess('ターゲットリストをインポートしました');
+    // Update local state
+    const app = _allApps.find((a) => a.packageName === pkg);
+    if (app) app.isTarget = isTarget;
   } catch (err) {
-    showError(`インポートに失敗しました: ${err.message}`);
+    showError(`変更失敗: ${err.message}`);
+    const cb = document.querySelector(`input[data-pkg="${pkg}"]`);
+    if (cb) cb.checked = !isTarget;
   }
 }
 
-/**
- * Export the current target list.
- */
 async function handleTargetExport() {
   try {
-    const data = await execCommand('target_export', {});
-    const path = data && data.path ? data.path : '/data/adb/modules/tee_simulator_plus/config/target.txt';
-    showSuccess(`ターゲットリストをエクスポートしました: ${path}`);
+    const data = await execCommand('target_export');
+    showSuccess(`エクスポート: ${data.path || '/data/adb/tricky_store/target.txt'}`);
   } catch (err) {
-    showError(`エクスポートに失敗しました: ${err.message}`);
+    showError(`エクスポート失敗: ${err.message}`);
+  }
+}
+
+async function handleTargetImport(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  try {
+    const content = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = () => reject(new Error('読み込み失敗'));
+      r.readAsText(file);
+    });
+    const tmpPath = `/data/local/tmp/tsp_targets_${Date.now()}.txt`;
+    const b64 = btoa(unescape(encodeURIComponent(content)));
+    await ksuExec(`echo '${b64}' | base64 -d > '${tmpPath}'`);
+    const result = await execCommand('target_import', { path: tmpPath });
+    await ksuExec(`rm -f '${tmpPath}'`);
+    showSuccess(`インポート完了: ${result.imported || 0}件`);
+    await loadTargetList();
+    await loadStatus();
+  } catch (err) {
+    showError(`インポート失敗: ${err.message}`);
+  } finally {
+    event.target.value = '';
   }
 }
 
 // ============================================================
-// Task 19: Diagnostics Panel
+// Diagnostics panel
 // ============================================================
 
-/**
- * Initialize the Diagnostics panel — run and calibrate buttons.
- */
 function initDiagnosticsPanel() {
-  const runBtn = document.getElementById('diagnostics-run-btn');
-  const calibrateBtn = document.getElementById('diagnostics-calibrate-btn');
-
-  if (runBtn) {
-    runBtn.addEventListener('click', runDiagnostics);
-  }
-
-  if (calibrateBtn) {
-    calibrateBtn.addEventListener('click', calibrateProfile);
-  }
+  const runBtn = document.getElementById('btn-run-diagnostics');
+  const calBtn = document.getElementById('btn-calibrate');
+  if (runBtn) runBtn.addEventListener('click', runDiagnostics);
+  if (calBtn) calBtn.addEventListener('click', calibrateProfile);
 }
 
-/**
- * Run the timing side-channel diagnostics profiler.
- */
 async function runDiagnostics() {
-  const sampleCountInput = document.getElementById('diagnostics-sample-count');
-  const thresholdInput = document.getElementById('diagnostics-threshold');
+  const sampleEl = document.getElementById('input-sample-count');
+  const thresholdEl = document.getElementById('input-threshold');
+  const sampleCount = sampleEl ? parseInt(sampleEl.value, 10) || 500 : 500;
+  const runBtn = document.getElementById('btn-run-diagnostics');
   const resultsEl = document.getElementById('diagnostics-results');
-  const runBtn = document.getElementById('diagnostics-run-btn');
 
-  const sampleCount = sampleCountInput ? parseInt(sampleCountInput.value, 10) || 100 : 100;
-  const threshold = thresholdInput ? parseFloat(thresholdInput.value) || 2.0 : 2.0;
-
-  if (runBtn) {
-    runBtn.disabled = true;
-    runBtn.textContent = '実行中...';
-  }
-
-  if (resultsEl) {
-    resultsEl.innerHTML = '<p class="loading">診断を実行中...</p>';
-  }
+  if (runBtn) { runBtn.disabled = true; runBtn.textContent = '実行中...'; }
+  if (resultsEl) resultsEl.innerHTML = '<p class="loading">診断実行中...</p>';
 
   try {
     const data = await execCommand('profiler_run', { sampleCount, cpuCore: 0 });
-    renderDiagnosticsResults(data, threshold);
+    renderDiagnosticsResults(data);
   } catch (err) {
-    if (resultsEl) {
-      resultsEl.innerHTML = `<p class="error-state">診断に失敗しました: ${escapeHtml(err.message)}</p>`;
-    }
+    if (resultsEl) resultsEl.innerHTML = `<p class="error-state">診断失敗: ${escapeHtml(err.message)}</p>`;
   } finally {
-    if (runBtn) {
-      runBtn.disabled = false;
-      runBtn.textContent = '診断実行';
-    }
+    if (runBtn) { runBtn.disabled = false; runBtn.textContent = '実行'; }
   }
 }
 
-/**
- * Render diagnostics results with color-coded judgment.
- * @param {object} data — Profiler result data
- * @param {number} [threshold=2.0] — Detection threshold for judgment
- */
-function renderDiagnosticsResults(data, threshold = 2.0) {
-  const resultsEl = document.getElementById('diagnostics-results');
-  if (!resultsEl || !data) return;
+function renderDiagnosticsResults(d) {
+  const el = document.getElementById('diagnostics-results');
+  if (!el || !d) return;
+  const tA = d.attestedMeanMs ?? d.t_a ?? 0;
+  const tN = d.nonAttestedMeanMs ?? d.t_n ?? 0;
+  const diff = d.diffMs ?? d.diff ?? 0;
+  const ratio = d.ratio ?? 0;
+  const filtered = d.filteredBadSamples ?? 0;
+  const total = d.totalSamples ?? d.sampleCount ?? 0;
+  const judgment = d.judgment || (ratio > (d.threshold || 1.1) ? 'Positive' : 'Negative');
+  const positive = judgment === 'Positive';
 
-  const tA = data.t_a != null ? data.t_a : data.tA;
-  const tN = data.t_n != null ? data.t_n : data.tN;
-  const diff = data.diff != null ? data.diff : (tA - tN);
-  const ratio = data.ratio != null ? data.ratio : (tN !== 0 ? diff / tN : 0);
-  const filteredBadSamples = data.filteredBadSamples != null ? data.filteredBadSamples : data.filtered_bad_samples || 0;
-  const judgment = data.judgment || (Math.abs(ratio) > threshold ? 'Positive' : 'Negative');
-
-  const isPositive = judgment === 'Positive';
-  const judgmentColor = isPositive ? 'var(--color-danger, #e53935)' : 'var(--color-success, #43a047)';
-  const judgmentLabel = isPositive ? '⚠️ Positive (検出あり)' : '✓ Negative (検出なし)';
-
-  let html = `
-    <div class="diagnostics-result-card">
-      <h3>診断結果</h3>
-      <div class="result-grid">
-        <div class="result-item">
-          <span class="result-label">T_a (実測値)</span>
-          <span class="result-value">${typeof tA === 'number' ? tA.toFixed(3) : '—'} ms</span>
-        </div>
-        <div class="result-item">
-          <span class="result-label">T_n (基準値)</span>
-          <span class="result-value">${typeof tN === 'number' ? tN.toFixed(3) : '—'} ms</span>
-        </div>
-        <div class="result-item">
-          <span class="result-label">差分 (diff)</span>
-          <span class="result-value">${typeof diff === 'number' ? diff.toFixed(3) : '—'} ms</span>
-        </div>
-        <div class="result-item">
-          <span class="result-label">比率 (ratio)</span>
-          <span class="result-value">${typeof ratio === 'number' ? ratio.toFixed(4) : '—'}</span>
-        </div>
-        <div class="result-item">
-          <span class="result-label">除外サンプル数</span>
-          <span class="result-value">${filteredBadSamples}</span>
-        </div>
-        <div class="result-item result-judgment">
-          <span class="result-label">判定</span>
-          <span class="result-value" style="color: ${judgmentColor}; font-weight: bold;">${judgmentLabel}</span>
-        </div>
-      </div>
-    </div>`;
-
-  if (isPositive) {
-    html += `
-    <div class="advisory-card advisory-warning">
-      <h4>⚠️ タイミングサイドチャネル検出リスク</h4>
-      <p>診断の結果、TEE操作のタイミング差が検出可能なレベルにあります。以下の対策を推奨します：</p>
-      <ul>
-        <li><strong>Latency Equalizer を有効化</strong> — タイミング差を平準化します</li>
-        <li><strong>サンプル数を増やして再測定</strong> — より正確な結果を得られます</li>
-        <li><strong>閾値 (threshold) を確認</strong> — 現在の閾値: ${threshold}。環境に合わせて調整してください</li>
-      </ul>
-    </div>`;
-  }
-
-  resultsEl.innerHTML = html;
+  el.innerHTML = `
+    <div class="result-metric"><div class="result-metric-label">T_a (attested)</div><div class="result-metric-value">${Number(tA).toFixed(3)} ms</div></div>
+    <div class="result-metric"><div class="result-metric-label">T_n (non-attested)</div><div class="result-metric-value">${Number(tN).toFixed(3)} ms</div></div>
+    <div class="result-metric"><div class="result-metric-label">差分 (diff)</div><div class="result-metric-value">${Number(diff).toFixed(3)} ms</div></div>
+    <div class="result-metric"><div class="result-metric-label">比率 (ratio)</div><div class="result-metric-value">${Number(ratio).toFixed(3)}x</div></div>
+    <div class="result-metric"><div class="result-metric-label">外れ値</div><div class="result-metric-value">${filtered}/${total}</div></div>
+    <div class="result-judgment ${positive ? 'positive' : 'negative'}">${positive ? '⚠ Positive (検知の可能性)' : '✓ Negative'}</div>
+    ${positive ? `<div class="advisory">推奨: Latency_Equalizer を有効化、サンプル数を増やす、参照プロファイルを再キャリブレーション</div>` : ''}
+  `;
 }
 
-/**
- * Run calibration to establish a baseline profile.
- */
 async function calibrateProfile() {
-  const sampleCountInput = document.getElementById('diagnostics-sample-count');
-  const calibrateBtn = document.getElementById('diagnostics-calibrate-btn');
-
-  const sampleCount = sampleCountInput ? parseInt(sampleCountInput.value, 10) || 100 : 100;
-
-  if (calibrateBtn) {
-    calibrateBtn.disabled = true;
-    calibrateBtn.textContent = 'キャリブレーション中...';
-  }
-
+  const sampleEl = document.getElementById('input-sample-count');
+  const sampleCount = sampleEl ? parseInt(sampleEl.value, 10) || 500 : 500;
+  const btn = document.getElementById('btn-calibrate');
+  if (btn) { btn.disabled = true; btn.textContent = 'キャリブレーション中...'; }
   try {
     const data = await execCommand('profiler_calibrate', { sampleCount });
-    const mean = data && data.mean != null ? data.mean.toFixed(3) : '—';
-    const stddev = data && data.stddev != null ? data.stddev.toFixed(3) : '—';
-    showSuccess(`キャリブレーション完了 — 平均: ${mean} ms, 標準偏差: ${stddev} ms`);
+    showSuccess(`キャリブレーション完了: 平均=${Number(data.meanMs || 0).toFixed(3)}ms, σ=${Number(data.stddevMs || 0).toFixed(3)}ms`);
   } catch (err) {
-    showError(`キャリブレーションに失敗しました: ${err.message}`);
+    showError(`キャリブレーション失敗: ${err.message}`);
   } finally {
-    if (calibrateBtn) {
-      calibrateBtn.disabled = false;
-      calibrateBtn.textContent = 'キャリブレーション';
-    }
+    if (btn) { btn.disabled = false; btn.textContent = 'キャリブレーション'; }
   }
 }
 
 // ============================================================
-// Task 20: Logs Panel
+// Logs panel
 // ============================================================
 
-/** Interval ID for log polling */
-let logPollingInterval = null;
+let _logPollInterval = null;
 
-/**
- * Initialize the Logs panel — log level selector and polling.
- */
 function initLogsPanel() {
-  const logLevelSelect = document.getElementById('log-level-select');
-
-  if (logLevelSelect) {
-    logLevelSelect.addEventListener('change', (e) => {
-      handleLogLevelChange(e.target.value);
-    });
-  }
-
-  // Load logs immediately
+  const sel = document.getElementById('select-log-level');
+  if (sel) sel.addEventListener('change', (e) => handleLogLevelChange(e.target.value));
   loadLogs();
-
-  // Start polling
-  startLogPolling();
+  if (_logPollInterval) clearInterval(_logPollInterval);
+  _logPollInterval = setInterval(loadLogs, 5000);
 }
 
-/**
- * Load the latest log entries and render them in the log viewer.
- */
 async function loadLogs() {
-  const logViewer = document.getElementById('log-viewer');
-  const refreshIndicator = document.getElementById('log-refresh-indicator');
-
-  if (!logViewer) return;
-
-  // Show refresh indicator
-  if (refreshIndicator) {
-    refreshIndicator.classList.add('active');
-  }
-
+  const viewer = document.getElementById('log-viewer');
+  const refresh = document.getElementById('log-refresh-indicator');
+  if (!viewer) return;
+  if (refresh) refresh.removeAttribute('hidden');
   try {
     const data = await execCommand('log_tail', { lines: 200 });
-    const logContent = typeof data === 'string' ? data : (data && data.content ? data.content : JSON.stringify(data, null, 2));
-    logViewer.textContent = logContent;
-
-    // Auto-scroll to bottom
-    logViewer.scrollTop = logViewer.scrollHeight;
+    const content = (data && data.lines) ? data.lines.replace(/\\n/g, '\n') : '';
+    viewer.textContent = content || '(ログなし)';
+    viewer.scrollTop = viewer.scrollHeight;
   } catch (err) {
-    // Only show error if log viewer is empty (avoid spamming on poll failures)
-    if (!logViewer.textContent) {
-      logViewer.textContent = `ログの読み込みに失敗しました: ${err.message}`;
-    }
+    if (!viewer.textContent) viewer.textContent = `ログ読込失敗: ${err.message}`;
   } finally {
-    if (refreshIndicator) {
-      refreshIndicator.classList.remove('active');
-    }
+    if (refresh) refresh.setAttribute('hidden', '');
   }
 }
 
-/**
- * Start polling for log updates every 5 seconds.
- */
-function startLogPolling() {
-  // Clear any existing interval
-  if (logPollingInterval) {
-    clearInterval(logPollingInterval);
-  }
-
-  logPollingInterval = setInterval(() => {
-    loadLogs();
-  }, 5000);
-}
-
-/**
- * Handle log level change.
- * @param {string} level — New log level value
- */
 async function handleLogLevelChange(level) {
   try {
-    await execCommand('config_set', { key: 'logLevel', value: level });
-    showSuccess(`ログレベルを "${level}" に変更しました`);
+    await execCommand('config_set', { key: 'logLevel', value: level.toUpperCase() });
+    showSuccess(`ログレベル: ${level}`);
   } catch (err) {
-    showError(`ログレベルの変更に失敗しました: ${err.message}`);
+    showError(`変更失敗: ${err.message}`);
   }
 }
 
 // ============================================================
-// Updated DOMContentLoaded — Initialize All Panels
+// Init
 // ============================================================
 
-// Patch the DOMContentLoaded to also initialize all panels.
-// Since the original listener already runs, we add a second one for the panels.
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  if (typeof ksu !== 'undefined' && typeof ksu.fullScreen === 'function') {
+    try { ksu.fullScreen(true); } catch (e) {}
+  }
+  initTabs();
   initKeyboxPanel();
   initTargetPanel();
   initDiagnosticsPanel();
   initLogsPanel();
+
+  await loadStatus();
+  await loadKeyboxInfo();
+  await loadTargetList();
 });
