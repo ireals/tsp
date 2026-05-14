@@ -2,7 +2,7 @@
 # TEE Simulator Plus - Installation Script
 # Compatible with KernelSU and Magisk
 
-SKIPUNZIP=1
+SKIPUNZIP=0
 
 # ===== Environment Detection =====
 TSP_ENV=""
@@ -48,9 +48,9 @@ case "$TSP_ARCH" in
 esac
 ui_print "- Architecture: $TSP_ARCH ($TSP_LIB_DIR)"
 
-# ===== Extract Module Files =====
-ui_print "- Extracting module files..."
-unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >&2
+# ===== Module Files =====
+# Files are auto-extracted by Magisk/KernelSU (SKIPUNZIP=0)
+ui_print "- Module files extracted"
 
 # ===== Copy Native Library =====
 ui_print "- Installing native library for $TSP_LIB_DIR..."

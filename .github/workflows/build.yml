@@ -11,7 +11,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,19 +29,29 @@ jobs:
         run: |
           cd module/native
           $ANDROID_NDK_HOME/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=jni/Android.mk NDK_APPLICATION_MK=jni/Application.mk
-          echo "Build complete"
-          ls -la libs/arm64-v8a/ libs/armeabi-v7a/ 2>/dev/null || true
+          echo "=== Build complete ==="
+          find libs -name "*.so" -exec ls -la {} \;
 
-      - name: Copy built libraries to module
+      - name: Prepare module for packaging
         run: |
+          # Copy built .so files into module/libs/
           mkdir -p module/libs/arm64-v8a module/libs/armeabi-v7a
-          cp module/native/libs/arm64-v8a/libteesimplus.so module/libs/arm64-v8a/ 2>/dev/null || echo "arm64 lib not found"
-          cp module/native/libs/armeabi-v7a/libteesimplus.so module/libs/armeabi-v7a/ 2>/dev/null || echo "armv7 lib not found"
+          cp module/native/libs/arm64-v8a/libteesimplus.so module/libs/arm64-v8a/
+          cp module/native/libs/armeabi-v7a/libteesimplus.so module/libs/armeabi-v7a/
+
+          # Ensure required empty directories have a placeholder
+          # (zip needs at least one file per directory)
+          touch module/keyboxes/.placeholder
+          touch module/logs/.placeholder
+
+          # Remove .gitkeep files
+          find module -name ".gitkeep" -delete
 
       - name: Package module zip
         run: |
           cd module
-          zip -r ../tee-simulator-plus-v1.0.0.zip \
+          # Create zip with only installable files (no native source)
+          zip -r9 ../tee-simulator-plus-v1.0.0.zip \
             META-INF/ \
             module.prop \
             customize.sh \
@@ -55,13 +65,17 @@ jobs:
             logs/ \
             scripts/ \
             webroot/ \
-            -x "*.gitkeep" \
-            -x "native/*"
+            -x "*.gitkeep"
+
           cd ..
-          echo "Module zip created:"
+          echo "=== Module zip created ==="
           ls -la tee-simulator-plus-v1.0.0.zip
-          echo "Contents:"
+          echo ""
+          echo "=== Contents ==="
           unzip -l tee-simulator-plus-v1.0.0.zip
+          echo ""
+          echo "=== Verify zip integrity ==="
+          unzip -t tee-simulator-plus-v1.0.0.zip
 
       - name: Upload module zip
         uses: actions/upload-artifact@v4
