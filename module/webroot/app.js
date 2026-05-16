@@ -5,7 +5,9 @@
 
 'use strict';
 
-const MODULE_DIR = '/data/adb/modules/tee-simulator-plus';
+// Module ID is "tricky_store" (kept for compatibility with TEESimulator's original
+// upstream packaging — KSU WebUI lookups modules by this id).
+const MODULE_DIR = '/data/adb/modules/tricky_store';
 const BRIDGE_SCRIPT = `${MODULE_DIR}/scripts/bridge.sh`;
 const TRICKY_STORE_DIR = '/data/adb/tricky_store';
 
@@ -458,8 +460,16 @@ async function calibrateProfile() {
   if (btn) { btn.disabled = true; btn.textContent = 'キャリブレーション中...'; }
   try {
     const data = await execCommand('profiler_calibrate', { sampleCount });
-    showSuccess(`キャリブレーション完了: 平均=${Number(data.meanMs || 0).toFixed(3)}ms, σ=${Number(data.stddevMs || 0).toFixed(3)}ms`);
-    // Auto-populate equalizer reference if user wants to use it
+    const mean = Number(data.meanMs || 0);
+    const stddev = Number(data.stddevMs || 0);
+    showSuccess(`キャリブレーション完了: 平均=${mean.toFixed(3)}ms, σ=${stddev.toFixed(3)}ms`);
+
+    // Auto-populate equalizer fields with measured values
+    const targetInput = document.getElementById('eq-target');
+    const stdInput = document.getElementById('eq-stddev');
+    if (targetInput) targetInput.value = mean.toFixed(3);
+    if (stdInput) stdInput.value = stddev.toFixed(3);
+
     await loadEqualizerSettings();
   } catch (err) {
     showError(`キャリブレーション失敗: ${err.message}`);
@@ -476,13 +486,13 @@ async function loadEqualizerSettings() {
   try {
     const data = await execCommand('equalizer_get');
     const enableCb = document.getElementById('eq-enabled');
-    const refInput = document.getElementById('eq-reference');
+    const targetInput = document.getElementById('eq-target');
     const stdInput = document.getElementById('eq-stddev');
-    const thInput = document.getElementById('eq-threshold');
+    const maxInput = document.getElementById('eq-maxwait');
     if (enableCb) enableCb.checked = !!data.enabled;
-    if (refInput) refInput.value = Number(data.referenceMs || 0).toFixed(3);
+    if (targetInput) targetInput.value = Number(data.targetMs || 0).toFixed(3);
     if (stdInput) stdInput.value = Number(data.stddevMs || 0).toFixed(3);
-    if (thInput) thInput.value = Number(data.detectionThreshold || 1.1).toFixed(2);
+    if (maxInput) maxInput.value = Number(data.maxWaitMs || 50).toFixed(0);
   } catch (err) {
     console.warn('[TSP] equalizer settings load failed:', err.message);
   }
@@ -490,16 +500,16 @@ async function loadEqualizerSettings() {
 
 async function saveEqualizerSettings() {
   const enabled = document.getElementById('eq-enabled').checked;
-  const referenceMs = parseFloat(document.getElementById('eq-reference').value) || 0;
+  const targetMs = parseFloat(document.getElementById('eq-target').value) || 0;
   const stddevMs = parseFloat(document.getElementById('eq-stddev').value) || 0;
-  const detectionThreshold = parseFloat(document.getElementById('eq-threshold').value) || 1.1;
+  const maxWaitMs = parseFloat(document.getElementById('eq-maxwait').value) || 50;
 
   try {
     await execCommand('equalizer_set', {
       enabled,
-      referenceMs,
+      targetMs,
       stddevMs,
-      detectionThreshold
+      maxWaitMs
     });
     showSuccess('Latency Equalizerの設定を保存しました');
   } catch (err) {

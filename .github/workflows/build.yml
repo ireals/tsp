@@ -184,11 +184,15 @@ jobs:
           cp -r ../overlay/module/docs/* docs/ 2>/dev/null || true
           cp ../overlay/module/config/config.json config/ 2>/dev/null || true
 
-          # Update module.prop
+          # Update module.prop — keep Tricky-Store compatible ID for KSU WebUI compatibility
+          # IMPORTANT: KSU WebUI looks up modules by their `id` from module.prop.
+          # Keep id=tricky_store (TEESimulator's original) so the webroot/ path resolves
+          # to /data/adb/modules/tricky_store/webroot/index.html
           if [ -f module.prop ]; then
-            sed -i 's/^id=.*/id=tee-simulator-plus/' module.prop
             sed -i 's/^name=.*/name=TEE Simulator Plus (TEESimulator + WebUI + Latency Equalizer)/' module.prop
-            sed -i 's/^description=.*/description=TEESimulator with KSU WebUI for keybox\/target management and a built-in Latency Equalizer that pads attestation responses to evade timing-side-channel detection. Based on JingMatrix\/TEESimulator (GPL-3.0)./' module.prop
+            sed -i 's/^description=.*/description=TEESimulator with KSU WebUI for keybox\/target management and a built-in Latency Equalizer that pads attestation responses to match hardware-backed timing. Based on JingMatrix\/TEESimulator (GPL-3.0)./' module.prop
+            echo "=== module.prop ==="
+            cat module.prop
           fi
 
           # Append WebUI bootstrap to post-fs-data.sh (or service.sh if no post-fs-data)
@@ -200,6 +204,15 @@ jobs:
               printf '[ -f /data/adb/tricky_store/target.txt ] || { echo "# Tricky-Store target list" > /data/adb/tricky_store/target.txt; chmod 644 /data/adb/tricky_store/target.txt; }\n' >> "$sh_file"
             fi
           done
+
+          # Ensure WebUI files have correct permissions (readable by KSU manager)
+          find webroot -type d -exec chmod 0755 {} \; 2>/dev/null || true
+          find webroot -type f -exec chmod 0644 {} \; 2>/dev/null || true
+          find scripts -type f -exec chmod 0755 {} \; 2>/dev/null || true
+          find docs -type f -exec chmod 0644 {} \; 2>/dev/null || true
+          [ -f post-fs-data.sh ] && chmod 0755 post-fs-data.sh
+          [ -f service.sh ] && chmod 0755 service.sh
+          [ -f customize.sh ] && chmod 0755 customize.sh
 
           echo "=== Final structure ==="
           find . -maxdepth 3 -type f | sort

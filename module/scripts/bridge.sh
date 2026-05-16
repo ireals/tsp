@@ -2,15 +2,23 @@
 # TEE Simulator Plus — Shell Bridge (Command Router)
 # Entry: sh bridge.sh '<json input>'
 
-# Auto-detect MODDIR based on the bridge.sh location
+# Auto-detect MODDIR from where this script lives
 SCRIPT_DIR="${0%/*}"
 if [ -z "$MODDIR" ]; then
     case "$SCRIPT_DIR" in
         /*) MODDIR=$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd) ;;
-        *)  MODDIR="/data/adb/modules/tee-simulator-plus" ;;
+        *)  MODDIR="" ;;
     esac
 fi
-[ -d "$MODDIR" ] || MODDIR="/data/adb/modules/tee-simulator-plus"
+# Fallback to known module IDs
+if [ -z "$MODDIR" ] || [ ! -d "$MODDIR" ]; then
+    for candidate in /data/adb/modules/tricky_store /data/adb/modules/tee-simulator-plus; do
+        if [ -d "$candidate" ]; then
+            MODDIR="$candidate"
+            break
+        fi
+    done
+fi
 TRICKY_STORE_DIR="/data/adb/tricky_store"
 
 # Whitelist
